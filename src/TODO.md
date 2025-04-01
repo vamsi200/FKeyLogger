@@ -1,0 +1,1 @@
+- inject into a running python process and get its modules like gdb
