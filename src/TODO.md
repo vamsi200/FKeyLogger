@@ -1,1 +1,2 @@
-- inject into a running python process and get its modules like gdb
+- inject into a running python process and get its modules like gdb -> nope not a good idea buddy
+- Add proper logging
