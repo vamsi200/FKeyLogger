@@ -2,6 +2,7 @@ import psutil
 import os
 import time
 import sys
+import subprocess
 
 HIGHLY_SUS_MODULES = [
     "pynput",       # seen used for Keyboard & mouse monitoring
@@ -43,6 +44,16 @@ def check_dynamic_imports(pid):
     except Exception as e:
         print(f"Error: {e}")
 
+def get_modules_using_py_spy(pid):
+    result = subprocess.run(["py-spy", "dump", "--pid", str(pid)], capture_output=True, text=True)
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            for mod in HIGHLY_SUS_MODULES:
+                if mod in line:
+                    print(f"[!] `py-spy` found '{mod}' in PID {pid}")
+    else:
+        print(f"[py-spy] Failed to attach to PID {pid}")
+
 def check_python_imports(pid):
     if pid == CURRENT_PID or pid in DETECTED_PROCESSES:
         return None  
@@ -78,6 +89,7 @@ def check_python_imports(pid):
         if detections["modules"]:
             DETECTED_PROCESSES.add(pid)
             check_dynamic_imports(pid)
+            get_modules_using_py_spy(pid)
             return detections
         return None
 
