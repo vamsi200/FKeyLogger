@@ -1,8 +1,10 @@
+import select
 import psutil
 import os
 import time
 import sys
 import subprocess
+from inotify_simple import INotify, flags
 
 HIGHLY_SUS_MODULES = [
     "pynput",       # seen used for Keyboard & mouse monitoring
@@ -37,6 +39,81 @@ def require_root():
     if os.geteuid() != 0:
         print("[!] This script must be run as root.")
         sys.exit(1)
+
+
+def get_active_input_devices(timeout=10):
+    base_path = "/dev/input/by-id/"
+    inotify = INotify()
+    watch_descriptors = {}
+
+    for f_name in os.listdir(base_path):
+        f_path = os.path.join(base_path, f_name)
+        try:
+            link = os.path.realpath(f_path)
+            wd = inotify.add_watch(link, flags.ACCESS | flags.MODIFY | flags.OPEN)
+            watch_descriptors[wd] = link
+        except Exception as e:
+            print(f"Error reading {f_path}: {e}")
+    active_devices = set()
+    rlist, _, _ = select.select([inotify.fileno()], [], [], timeout)
+
+    if rlist:
+        for event in inotify.read():
+            if event.wd in watch_descriptors:
+                active_devices.add(watch_descriptors[event.wd])
+    else:
+        print("No input activity detected. Increase the Timeout if needed")
+    
+    return list(active_devices)
+
+def get_process_using_input_device():
+    event_paths = get_active_input_devices()
+    all_matches = []
+
+    for path in event_paths:
+        event_real = os.path.realpath(path)
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            pid = proc.info['pid']
+            fd_dir = f"/proc/{pid}/fd"
+            if not os.path.isdir(fd_dir):
+                continue
+            try:
+                for fd in os.listdir(fd_dir):
+                    fd_path = os.path.join(fd_dir, fd)
+                    try:
+                        target = os.readlink(fd_path)
+                        target_real = os.path.realpath(target)
+                        if target_real == event_real:
+                            all_matches.append(pid)
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+    return all_matches
+
+
+def check_x11_connection(pid):
+    # Have to rethink this approach
+    confidence = 0
+    try:
+        p = psutil.Process(pid)
+        env = p.environ()
+
+        xauth = env.get("XAUTHORITY")
+        display = env.get("DISPLAY")
+
+        if xauth and xauth.strip():
+            confidence += 1
+        if display and display.strip():
+            confidence += 1
+
+    except Exception as e:
+        print(f"Error reading env for PID {pid}: {e}")
+        return
+    return confidence
+
 
 def get_modules_using_py_spy(pid):
     logs = []
@@ -110,8 +187,25 @@ def check_python_imports(pid):
 
 def calculate_confidence(pid, detection_result, static_logs):
     score = 0
+    another_score = 0 # I will move it later
     high_sev_logs = []
     low_sev_logs = []
+    active_id = get_process_using_input_device()
+    
+    
+    for id in active_id:
+        p = psutil.Process(id)
+        # Have to implement some furthur checks to differentiate 
+        # whether this is a System level or a genuine process or a keylogger
+        if id != 0:
+            path = p.exe()
+            if not path.startswith(("/usr/bin/", "/usr/lib/", "/bin", "/sbin" )):
+                another_score+=1
+            # usually keyloggers work in background.. so..
+            if not p.terminal():
+                another_score+=1
+
+    print(another_score)
 
     if detection_result["modules"]:
         score += 1
@@ -149,6 +243,7 @@ def monitor_python_processes():
             # we are only checking python files.. what about others bud?
             if proc.info['name'] and 'python' in proc.info['name'].lower():
                 result = check_python_imports(proc.info['pid'])
+                print("=>", check_x11_connection(proc.info['pid']))
                 if result:
                     detection, logs = result
                     severity, high_sev_logs, low_sev_logs = calculate_confidence(detection['pid'], detection, logs)
