@@ -40,7 +40,7 @@ def require_root():
         print("[!] This script must be run as root.")
         sys.exit(1)
 
-
+# this only works if a process reads inputs directly from the events
 def get_active_input_devices(timeout=10):
     base_path = "/dev/input/by-id/"
     inotify = INotify()
@@ -93,25 +93,52 @@ def get_process_using_input_device():
 
     return all_matches
 
-
+# Need to change the unnecessary printing and the slight changes
 def check_x11_connection(pid):
-    # Have to rethink this approach
     confidence = 0
+    x11_inodes = set()
+
     try:
+        fds = os.listdir(f'/proc/{pid}/fd/')
+        for fd in fds:
+            try:
+                link = os.readlink(f'/proc/{pid}/fd/{fd}')
+                if link.startswith('socket:['):
+                    inode = link.split('[')[1].split(']')[0]
+                    x11_inodes.add(inode)
+            except Exception:
+                continue
+
+        output = subprocess.run(['ss', '-xp'], capture_output=True, text=True)
+        for line in output.stdout.splitlines():
+            if '/tmp/.X11-unix/X0' in line:
+                for inode in x11_inodes:
+                    if inode in line:
+                        print(f"[!] PID {pid} is connected to X11 socket ({inode}) => HIGH suspicion")
+                        confidence += 2
+
         p = psutil.Process(pid)
         env = p.environ()
-
+        cmd = p.cmdline()
+        with open(f"/proc/{pid}/maps", "r") as f:
+            maps = f.read()
+            print("maps => ", maps)
+            
+        print("cmd => ", cmd)
         xauth = env.get("XAUTHORITY")
         display = env.get("DISPLAY")
 
         if xauth and xauth.strip():
+            print(f"[i] XAUTHORITY set: {xauth}")
             confidence += 1
         if display and display.strip():
+            print(f"[i] DISPLAY set: {display}")
             confidence += 1
 
     except Exception as e:
-        print(f"Error reading env for PID {pid}: {e}")
-        return
+        print(f"[x] Error analyzing PID {pid}: {e}")
+        return 0
+
     return confidence
 
 
@@ -205,7 +232,7 @@ def calculate_confidence(pid, detection_result, static_logs):
             if not p.terminal():
                 another_score+=1
 
-    print(another_score)
+#    print(another_score)
 
     if detection_result["modules"]:
         score += 1
@@ -243,7 +270,8 @@ def monitor_python_processes():
             # we are only checking python files.. what about others bud?
             if proc.info['name'] and 'python' in proc.info['name'].lower():
                 result = check_python_imports(proc.info['pid'])
-                print("=>", check_x11_connection(proc.info['pid']))
+                confidence = check_x11_connection(proc.info['pid'])
+                print("Confidence => ", confidence)
                 if result:
                     detection, logs = result
                     severity, high_sev_logs, low_sev_logs = calculate_confidence(detection['pid'], detection, logs)
