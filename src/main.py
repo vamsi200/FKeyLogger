@@ -114,32 +114,40 @@ def check_x11_connection(pid):
             if '/tmp/.X11-unix/X0' in line:
                 for inode in x11_inodes:
                     if inode in line:
-                        print(f"[!] PID {pid} is connected to X11 socket ({inode}) => HIGH suspicion")
-                        confidence += 2
+                        confidence+=1
 
         p = psutil.Process(pid)
         env = p.environ()
-        cmd = p.cmdline()
-        with open(f"/proc/{pid}/maps", "r") as f:
-            maps = f.read()
-            print("maps => ", maps)
-            
-        print("cmd => ", cmd)
         xauth = env.get("XAUTHORITY")
         display = env.get("DISPLAY")
 
         if xauth and xauth.strip():
-            print(f"[i] XAUTHORITY set: {xauth}")
             confidence += 1
         if display and display.strip():
-            print(f"[i] DISPLAY set: {display}")
             confidence += 1
 
+        for line in subprocess.check_output(['lsof', '-p', str(pid)], stderr=subprocess.DEVNULL).decode().splitlines():
+            if 'libX11.so' in line or 'libXt.so' in line:
+                confidence += 1
     except Exception as e:
         print(f"[x] Error analyzing PID {pid}: {e}")
         return 0
 
     return confidence
+
+def check_input_freq(pid):
+    pass
+
+def check_network_activity(pid):
+    pass
+
+def check_file_activity(pid):
+    pass
+
+# To check other processes, not only python ones
+def check_loaded_libs(pid):
+    pass
+
 
 
 def get_modules_using_py_spy(pid):
@@ -150,7 +158,7 @@ def get_modules_using_py_spy(pid):
         for line in result.stdout.splitlines():
             for mod in HIGHLY_SUS_MODULES:
                 if mod in line:
-                    logs.append(f"[py-spy] Found module: {mod}")
+                    logs.append(f"{mod}")
                     found = True
         return found, logs
     else:
@@ -218,8 +226,16 @@ def calculate_confidence(pid, detection_result, static_logs):
     high_sev_logs = []
     low_sev_logs = []
     active_id = get_process_using_input_device()
+    spy_flag, spy_logs = get_modules_using_py_spy(pid)
+
+    check_x11 = check_x11_connection(pid)
     
-    
+    # This only works with python process.. 
+    if check_x11 > 0:
+        if spy_flag == True:
+            for logs in spy_logs: 
+                high_sev_logs.append(f"[Suspicious Activity] X11 input hooks + known suspect modules: {logs}")
+            
     for id in active_id:
         p = psutil.Process(id)
         # Have to implement some furthur checks to differentiate 
@@ -244,13 +260,12 @@ def calculate_confidence(pid, detection_result, static_logs):
         else:
             low_sev_logs.append(log)
 
-    spy_flag, spy_logs = get_modules_using_py_spy(pid)
     if spy_flag:
         score += 1
     for log in spy_logs:
         for mod in HIGHLY_SUS_MODULES:
             if mod in log:
-                high_sev_logs.append(log)
+                high_sev_logs.append(f"[py-spy] Found module: {mod}")
                 break
         else:
             low_sev_logs.append(log)
@@ -270,8 +285,6 @@ def monitor_python_processes():
             # we are only checking python files.. what about others bud?
             if proc.info['name'] and 'python' in proc.info['name'].lower():
                 result = check_python_imports(proc.info['pid'])
-                confidence = check_x11_connection(proc.info['pid'])
-                print("Confidence => ", confidence)
                 if result:
                     detection, logs = result
                     severity, high_sev_logs, low_sev_logs = calculate_confidence(detection['pid'], detection, logs)
