@@ -1,4 +1,4 @@
-event_device = "/dev/input/event4"
+event_device = "/dev/input/event22"
 try:
     print(f"Opening {event_device}...")
     with open(event_device, "rb") as f:
