@@ -2,11 +2,12 @@
 - Add proper logging
 - We are only checking python files. We have to up our game
 - !> [!IMPORTANT]
-> Check Network part
+> Check Network part - done some of it
 
 - Add Checks -> like precautions:
   checking bashrc, zshrc files
   check if some process is running `history -a` or something like that, i.e logging history to a file
   PAM abuse
 
+- Maybe in way future, implement sandboxing?
 
