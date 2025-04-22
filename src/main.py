@@ -222,6 +222,7 @@ def check_input_access_frequency(threshold, ev_threshold, timeout):
 # or some paths that are legitimate that we may ignore.
 # if a process is using High cpu or memory usage - I doubt this would be necessary 
 # if a process opening excessive fd's
+# if a process is running as root(except ours)
 def verify_process(pid):
     pass
 
@@ -262,8 +263,30 @@ def check_network_activity(input_pid, timeout):
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
                             print("Error: Failed to get the process details")
 
-def check_file_activity(pid):
-    pass
+# goal isn't to check every process.. we narrow down to a one or two processes that we find suspicious and then use this
+def check_file_activity(pid, timeout):
+    processed = []
+    p_time = time.time()
+    inotify = INotify()
+    watch_flags = flags.CLOSE_WRITE | flags.MODIFY
+
+    while time.time() - p_time < timeout:
+        try:
+            p = psutil.Process(pid)
+            p_name = p.name()
+
+            for files in p.open_files():
+                if files.path not in processed:
+                    inotify.add_watch(files.path, watch_flags)
+                    for _ in inotify.read():
+                        processed.append(files.path) 
+                        # todo fix: Right now it'll always point to the last file from the outer loop
+                        print(f"{p_name} with pid [{pid}] actively writing to - {files.path}")
+                        return
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            print("Error: Failed to get the process details")
+            return
+        time.sleep(0.0) # you remove, cpu boom
 
 # To check other processes, not only python ones
 def check_loaded_libs(pid):
@@ -443,6 +466,7 @@ if __name__ == "__main__":
     print("We are running.. Press CTRL+C to stop.")
     # print(check_input_access_frequency(3,5,10))
     # monitor_python_processes()
-    check_network_activity(2915, 5)
+    # check_network_activity(2915, 5)
+    check_file_activity(161122, 30)
 
 
