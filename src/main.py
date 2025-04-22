@@ -1,10 +1,12 @@
 import select
 import psutil
 import os
+import ipaddress
 import time
 import sys
 import subprocess
 from inotify_simple import INotify, flags
+from collections import defaultdict
 
 HIGHLY_SUS_MODULES = [
     "pynput",       # seen used for Keyboard & mouse monitoring
@@ -31,6 +33,39 @@ COULDBE_SUS_MODULES = [
     "subprocess",   # Running system commands
     "os.system",    # Running system commands
     "shutil.copy",  # Copying itself for persistence?
+]
+
+white_list_ports = [8080, 443, 22]
+current_user = os.getlogin()
+suspicious_paths = [
+    "/tmp/",
+    "/var/tmp/",
+    "/dev/shm/",
+    "/run/",
+    "/run/user/",
+    "/run/lock/",
+    "/run/systemd/",
+    f"home/{current_user}/.cache/",
+    f"home/{current_user}/.local/",
+    f"home/{current_user}/.config/",
+    f"home/{current_user}/.mozilla/",
+    f"home/{current_user}/.mozilla/firefox/",
+    f"home/{current_user}/.gnupg/",
+    f"home/{current_user}/.vscode/",
+    f"home/{current_user}/.Xauthority",
+    f"home/{current_user}/.ICEauthority",
+    f"home/{current_user}/.ssh/",
+    f"home/{current_user}/.dbus/",
+    f"home/{current_user}/.gvfs/",
+    "/usr/lib/tmpfiles.d/",
+    "/lib/modules/",
+    "/etc/rc.local",
+    "/etc/init.d/",
+    "/etc/systemd/system/",
+    "/etc/cron.d/",
+    "/etc/cron.daily/",
+    "/etc/cron.hourly/",
+    "/etc/profile.d/"
 ]
 
 CURRENT_PID = os.getpid()
@@ -96,8 +131,8 @@ def get_process_using_input_device():
 # Need to change the unnecessary printing and the slight changes
 def check_x11_connection(pid):
     confidence = 0
+    access_rate = 0
     x11_inodes = set()
-
     try:
         fds = os.listdir(f'/proc/{pid}/fd/')
         for fd in fds:
@@ -114,7 +149,8 @@ def check_x11_connection(pid):
             if '/tmp/.X11-unix/X0' in line:
                 for inode in x11_inodes:
                     if inode in line:
-                        confidence+=1
+                        confidence = 1
+                        access_rate+=1
 
         p = psutil.Process(pid)
         env = p.environ()
@@ -133,13 +169,98 @@ def check_x11_connection(pid):
         print(f"[x] Error analyzing PID {pid}: {e}")
         return 0
 
-    return confidence
+    return confidence,access_rate
 
-def check_input_freq(pid):
+# this just returns all the prcoesses that met the condition
+# still we need to differentiate between a legitimate and a suspicious processes
+#todo : maybe in future, change the logic to not use process_iter mutliple times.. just one for all
+def check_input_access_frequency(threshold, ev_threshold, timeout):
+    access_counts = defaultdict(int)
+    printed_pids = set()
+    x11_confidence = {}
+    suspicious_processes = []
+
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        pids = get_process_using_input_device()
+        
+        for proc in psutil.process_iter(['pid']):
+            pid = proc.pid
+            try:
+                if pid not in x11_confidence:
+                    x11_conf, access_rate = check_x11_connection(pid)
+                    x11_confidence[pid] = x11_conf
+
+                    if x11_conf >= threshold:
+                        suspicious_processes.append((pid, 'x11', x11_conf, access_rate))
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        for pid in pids:
+            access_counts[pid] += 1
+            try:
+                if pid in printed_pids:
+                    continue
+
+                proc = psutil.Process(pid)
+                evdev_count = access_counts[pid]
+                if evdev_count >= ev_threshold:
+                    suspicious_processes.append((pid, 'evdev', evdev_count))
+
+                printed_pids.add(pid)
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+    return suspicious_processes
+
+# todo: this will be most important one, will be added to as many functions as possible
+# if a process is a gui/background process - keyloggers tend to be in background
+# if a process is using symlinks to mask itself as a legitimate process by using '/usr/bin/'
+# or some paths that are legitimate that we may ignore.
+# if a process is using High cpu or memory usage - I doubt this would be necessary 
+# if a process opening excessive fd's
+def verify_process(pid):
     pass
 
-def check_network_activity(pid):
-    pass
+
+#todo: 
+# if a process is opening sudden connections 
+# if a process is doing any port-forwarding -> no idea how to approach this
+def check_network_activity(input_pid, timeout):
+    conn_count = defaultdict(int)
+    c_time = time.time()
+
+    while time.time() - c_time < timeout:
+        try:
+            conn = psutil.net_connections(kind='all')
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            print("Error: Failed to get the process details")
+            return
+        for i in conn:
+            if i.status == 'ESTABLISHED' and i.raddr and i.pid:
+                conn_count[i.pid] += 1
+        time.sleep(1)
+    conn = psutil.net_connections(kind='all')
+    # todo : verify_process - be added here to do furthur checks
+    for i in conn:
+        if input_pid == i.pid and i.status != None:
+            for pid, count in conn_count.items():
+                if pid == i.pid and i.raddr:
+                    ip = i.raddr.ip
+                    # not a very effective way - since a process could still 
+                    # mask as from white listed ports or paths
+                    if not ipaddress.ip_address(ip).is_private and i.raddr.port not in white_list_ports:
+                        try:
+                            p = psutil.Process(pid)
+                            process_name = p.name()
+                            path = p.exe()
+                            if any(path.startswith(sus_path) for sus_path in suspicious_paths):
+                                print(f"Process - {process_name}, connecting to foreign address - {ip}") 
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            print("Error: Failed to get the process details")
 
 def check_file_activity(pid):
     pass
@@ -228,7 +349,7 @@ def calculate_confidence(pid, detection_result, static_logs):
     active_id = get_process_using_input_device()
     spy_flag, spy_logs = get_modules_using_py_spy(pid)
 
-    check_x11 = check_x11_connection(pid)
+    check_x11, _ = check_x11_connection(pid)
     
     # This only works with python process.. 
     if check_x11 > 0:
@@ -320,4 +441,8 @@ def monitor_python_processes():
 if __name__ == "__main__":
     require_root()
     print("We are running.. Press CTRL+C to stop.")
-    monitor_python_processes()
+    # print(check_input_access_frequency(3,5,10))
+    # monitor_python_processes()
+    check_network_activity(2915, 5)
+
+
