@@ -158,7 +158,8 @@ def check_x11_connection(pid):
             confidence += 1
         if display and display.strip():
             confidence += 1
-
+       
+        # modify below?
         for line in subprocess.check_output(['lsof', '-p', str(pid)], stderr=subprocess.DEVNULL).decode().splitlines():
             if 'libX11.so' in line or 'libXt.so' in line:
                 confidence += 1
@@ -171,7 +172,7 @@ def check_x11_connection(pid):
 # this just returns all the prcoesses that met the condition
 # still we need to differentiate between a legitimate and a suspicious processes
 #todo : maybe in future, change the logic to not use process_iter mutliple times.. just one for all
-def check_input_access_frequency(threshold, ev_threshold, timeout, lib):
+def check_input_access_frequency(threshold, ev_threshold, timeout):
     access_counts = defaultdict(int)
     printed_pids = set()
     x11_confidence = {}
@@ -321,13 +322,14 @@ def kill_process(pid):
     except psutil.AccessDenied:
         print(f"Access denied to kill {pid}.")
 
+# Below 4 functions should only be invoked once we narrow down processes?
 def get_libs_using_mem_maps(pid, lib):
     found_libs = []
     try:
         with open(f"/proc/{pid}/maps", "r") as maps_file:
             maps_content = maps_file.read()
             for mod in lib:
-                if mod in maps_content:
+                if mod in maps_content and mod not in found_libs:
                     found_libs.append(mod)
         return found_libs
     except(FileNotFoundError, PermissionError):
@@ -340,12 +342,51 @@ def read_source_code(lib, path):
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read().lower()
             for mod in lib:
-                if mod in content:
+                if mod in content and mod not in found_libs:
                     found_libs.append(mod)
         return found_libs
     except(FileNotFoundError, PermissionError):
         print("Error: Failed to read maps")
         return []
+
+def get_modules_using_lsof(pid, libs):
+    found_libs = []
+    try:
+        output = subprocess.check_output(['lsof', '-p', str(pid)], stderr=subprocess.DEVNULL)
+        lines = output.decode().splitlines()
+
+        for line in lines:
+            p = line.split()
+            # assumption is that Name starts at 9 or more.. maybe fix this logic?
+            if len(p) >= 9:
+                filepath = p[-1]
+                filename = os.path.basename(filepath)
+                for lib in libs:
+                    if lib in filename and lib not in found_libs:
+                        found_libs.append(lib)
+        return found_libs
+    except:
+        print("Error: Failed to check output using lsof")
+        return []
+
+def get_modules_using_pmap(pid, libs):
+    found_libs = []
+    try:
+        output = subprocess.check_output(['pmap', str(pid)], stderr=subprocess.DEVNULL)
+        lines = output.decode().splitlines()
+
+        for line in lines:
+            p = line.split()
+            if len(p) >= 3:
+                module = p[-1]
+                for lib in libs:
+                    if lib in module and lib not in found_libs:
+                        found_libs.append(lib)
+        return found_libs
+    except:
+        print("Error: Failed to check output using lsof")
+        return []
+
     
 def check_python_imports(pid, lib):
     if pid == CURRENT_PID or pid in DETECTED_PROCESSES:
@@ -488,8 +529,14 @@ if __name__ == "__main__":
     require_root()
     print("We are running.. Press CTRL+C to stop.")
     lib = load_sus_libraries()
+    # print(get_modules_using_pmap(47460,lib))
+    with open(f"/proc/47460/mem", "rb") as mem_file:
+        address = 0
+        mem_file.seek(address)
+        data = mem_file.read(1024)  # read 1MB
+        print(data)
     # print(check_input_access_frequency(3,5,10))
-    monitor_python_processes(lib)
+    # monitor_python_processes(lib)
     # check_network_activity(2915, 5)
     # check_file_activity(161122, 30)
     # print(get_libs_using_mem_maps(44766, lib))
