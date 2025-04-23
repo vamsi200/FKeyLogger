@@ -172,7 +172,7 @@ def check_x11_connection(pid):
 # this just returns all the prcoesses that met the condition
 # still we need to differentiate between a legitimate and a suspicious processes
 #todo : maybe in future, change the logic to not use process_iter mutliple times.. just one for all
-def check_input_access_frequency(threshold, ev_threshold, timeout):
+def check_input_access_frequency(threshold, timeout):
     access_counts = defaultdict(int)
     printed_pids = set()
     x11_confidence = {}
@@ -204,7 +204,7 @@ def check_input_access_frequency(threshold, ev_threshold, timeout):
 
                 proc = psutil.Process(pid)
                 evdev_count = access_counts[pid]
-                if evdev_count >= ev_threshold:
+                if evdev_count:
                     suspicious_processes.append((pid, 'evdev', evdev_count))
 
                 printed_pids.add(pid)
@@ -530,12 +530,12 @@ if __name__ == "__main__":
     print("We are running.. Press CTRL+C to stop.")
     lib = load_sus_libraries()
     # print(get_modules_using_pmap(47460,lib))
-    with open(f"/proc/47460/mem", "rb") as mem_file:
-        address = 0
-        mem_file.seek(address)
-        data = mem_file.read(1024)  # read 1MB
-        print(data)
-    # print(check_input_access_frequency(3,5,10))
+    # with open(f"/proc/47460/mem", "rb") as mem_file:
+    #     address = 0
+    #     mem_file.seek(address)
+    #     data = mem_file.read(1024)  # read 1MB
+    #     print(data)
+    print(check_input_access_frequency(3,10))
     # monitor_python_processes(lib)
     # check_network_activity(2915, 5)
     # check_file_activity(161122, 30)
