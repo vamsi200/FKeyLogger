@@ -8,15 +8,6 @@ import subprocess
 from inotify_simple import INotify, flags
 from collections import defaultdict
 
-HIGHLY_SUS_MODULES = [
-    "pynput",       # seen used for Keyboard & mouse monitoring
-    "keyboard",     # A Keyboard hook
-    "pyxhook",      # Keylogging for X11
-    "win32api",     # Windows API for key detection
-    "win32gui",     # To capture active windows
-    "win32con",     # Windows constants
-    "win32clipboard",  # Clipboard logging
-]
 
 COULDBE_SUS_MODULES = [    
     "pyautogui",    # could be used for automation or keylogging
@@ -74,6 +65,12 @@ def require_root():
     if os.geteuid() != 0:
         print("[!] This script must be run as root.")
         sys.exit(1)
+
+def load_sus_libraries():
+    file_path = "libraries.txt"
+    with open(file_path, 'r') as f:
+        return [line.strip() for line in f if line.strip()]
+            
 
 # this only works if a process reads inputs directly from the events
 def get_active_input_devices(timeout=10):
@@ -174,7 +171,7 @@ def check_x11_connection(pid):
 # this just returns all the prcoesses that met the condition
 # still we need to differentiate between a legitimate and a suspicious processes
 #todo : maybe in future, change the logic to not use process_iter mutliple times.. just one for all
-def check_input_access_frequency(threshold, ev_threshold, timeout):
+def check_input_access_frequency(threshold, ev_threshold, timeout, lib):
     access_counts = defaultdict(int)
     printed_pids = set()
     x11_confidence = {}
@@ -268,7 +265,7 @@ def check_file_activity(pid, timeout):
     processed = []
     p_time = time.time()
     inotify = INotify()
-    watch_flags = flags.CLOSE_WRITE | flags.MODIFY
+    watch_flags = flags.CLOSE_WRITE | flags.MODIFY | flags.CREATE | flags.OPEN
 
     while time.time() - p_time < timeout:
         try:
@@ -294,13 +291,13 @@ def check_loaded_libs(pid):
 
 
 
-def get_modules_using_py_spy(pid):
+def get_modules_using_py_spy(pid, lib):
     logs = []
     result = subprocess.run(["py-spy", "dump", "--pid", str(pid)], capture_output=True, text=True)
     if result.returncode == 0:
         found = False
         for line in result.stdout.splitlines():
-            for mod in HIGHLY_SUS_MODULES:
+            for mod in lib:
                 if mod in line:
                     logs.append(f"{mod}")
                     found = True
@@ -310,51 +307,78 @@ def get_modules_using_py_spy(pid):
         return False, logs
 
 def kill_process(pid):
-    p = psutil.Process(pid)
-    p.terminate()
-    print(" Checking whether the process is still running")
-    time.sleep(5)
-    if psutil.pid_exists(pid):
-        print(" Still running.. trying to kill them again")
-        kill_process(pid)
-    else:
-        print(" Job Done")
+    try:
+        p = psutil.Process(pid)
+        p.terminate() 
+        p.wait(timeout=5)
+        print(f" Job Done.")
+    except psutil.NoSuchProcess:
+        print(f"No such process with PID {pid}.")
+    except psutil.TimeoutExpired:
+        p.kill()
+        print(f"Timeout: Process {pid} did not terminate within the timeout.")
+        print(f"Process {pid} forcefully terminated.")
+    except psutil.AccessDenied:
+        print(f"Access denied to kill {pid}.")
 
-def check_python_imports(pid):
+def get_libs_using_mem_maps(pid, lib):
+    found_libs = []
+    try:
+        with open(f"/proc/{pid}/maps", "r") as maps_file:
+            maps_content = maps_file.read()
+            for mod in lib:
+                if mod in maps_content:
+                    found_libs.append(mod)
+        return found_libs
+    except(FileNotFoundError, PermissionError):
+        print("Error: Failed to read maps")
+        return []
+
+def read_source_code(lib, path):
+    found_libs = []
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read().lower()
+            for mod in lib:
+                if mod in content:
+                    found_libs.append(mod)
+        return found_libs
+    except(FileNotFoundError, PermissionError):
+        print("Error: Failed to read maps")
+        return []
+    
+def check_python_imports(pid, lib):
     if pid == CURRENT_PID or pid in DETECTED_PROCESSES:
         return None
-
     detections = {"pid": pid, "path": None, "modules": set()}
     logs = []
-
     try:
         process = psutil.Process(pid)
         cmdline = process.cmdline()
 
         if len(cmdline) > 1:
             detections["path"] = os.path.join(process.cwd(), cmdline[1])
-
+        
+        maps = get_libs_using_mem_maps(pid, lib)
+        
+        if maps:
+            for mod in maps:
+                detections["modules"].add(mod)
+                logs.append(f"[maps] Found `{mod}` in /proc/{pid}/maps")
+               
         for fd in os.listdir(f"/proc/{pid}/fd"):
             fd_path = os.readlink(f"/proc/{pid}/fd/{fd}")
-            for mod in HIGHLY_SUS_MODULES + COULDBE_SUS_MODULES:
+            for mod in lib:
                 if mod in fd_path:
                     detections["modules"].add(mod)
                     logs.append(f"[fd] Found `{mod}` in file descriptor path")
-
-        with open(f"/proc/{pid}/maps", "r") as maps_file:
-            maps_content = maps_file.read()
-            for mod in HIGHLY_SUS_MODULES + COULDBE_SUS_MODULES:
-                if mod in maps_content:
-                    detections["modules"].add(mod)
-                    logs.append(f"[maps] Found `{mod}` in /proc/{pid}/maps")
-
+         
         if detections["path"] and os.path.isfile(detections["path"]):
-            with open(detections["path"], 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read().lower()
-                for mod in HIGHLY_SUS_MODULES + COULDBE_SUS_MODULES:
-                    if mod in content:
-                        detections["modules"].add(mod)
-                        logs.append(f"[code] Found `{mod}` in script source code")
+            sc = read_source_code(lib, detections["path"])
+            if sc:
+                for mod in sc:
+                    detections["modules"].add(mod)
+                    logs.append(f"[code] Found `{mod}` in script source code")
 
         if detections["modules"]:
             DETECTED_PROCESSES.add(pid)
@@ -364,13 +388,13 @@ def check_python_imports(pid):
     except (psutil.AccessDenied, FileNotFoundError, psutil.NoSuchProcess, PermissionError):
         return None  
 
-def calculate_confidence(pid, detection_result, static_logs):
+def calculate_confidence(pid, detection_result, static_logs, lib):
     score = 0
     another_score = 0 # I will move it later
     high_sev_logs = []
     low_sev_logs = []
     active_id = get_process_using_input_device()
-    spy_flag, spy_logs = get_modules_using_py_spy(pid)
+    spy_flag, spy_logs = get_modules_using_py_spy(pid, lib)
 
     check_x11, _ = check_x11_connection(pid)
     
@@ -397,7 +421,7 @@ def calculate_confidence(pid, detection_result, static_logs):
     if detection_result["modules"]:
         score += 1
     for log in static_logs:
-        for mod in HIGHLY_SUS_MODULES:
+        for mod in lib:
             if mod in log:
                 high_sev_logs.append(log)
                 break
@@ -407,7 +431,7 @@ def calculate_confidence(pid, detection_result, static_logs):
     if spy_flag:
         score += 1
     for log in spy_logs:
-        for mod in HIGHLY_SUS_MODULES:
+        for mod in lib:
             if mod in log:
                 high_sev_logs.append(f"[py-spy] Found module: {mod}")
                 break
@@ -423,40 +447,39 @@ def calculate_confidence(pid, detection_result, static_logs):
 
     return severity, high_sev_logs, low_sev_logs
 
-def monitor_python_processes():
+def monitor_python_processes(lib):
     while True:
         for proc in psutil.process_iter(['pid', 'name']):
             # we are only checking python files.. what about others bud?
             if proc.info['name'] and 'python' in proc.info['name'].lower():
-                result = check_python_imports(proc.info['pid'])
+                result = check_python_imports(proc.info['pid'], lib)
                 if result:
                     detection, logs = result
-                    severity, high_sev_logs, low_sev_logs = calculate_confidence(detection['pid'], detection, logs)
-
-                    if severity != "HIGH" and not high_sev_logs:
+                    severity, high_sev_logs, low_sev_logs = calculate_confidence(detection['pid'], detection, logs, lib)
+                    if severity != "HIGH":
                         continue
+                    else:
+                        print("\n[ALERT] Suspicious Python process detected!")
+                        print(f"├─ PID      : {detection['pid']}")
+                        print(f"├─ Severity : {severity}")
+                        print(f"├─ Path     : {detection['path']}")
+                        print(f"└─ Evidence:")
 
-                    print("\n[ALERT] Suspicious Python process detected!")
-                    print(f"├─ PID      : {detection['pid']}")
-                    print(f"├─ Severity : {severity}")
-                    print(f"├─ Path     : {detection['path']}")
-                    print(f"└─ Evidence:")
+                        if high_sev_logs:
+                            print(" Highly Suspicious:")
+                            for log in high_sev_logs:
+                                print(f"      • {log}")
+                        if low_sev_logs:
+                            print(" Other Suspicious:")
+                            for log in low_sev_logs:
+                                print(f"      • {log}")
+                        if not high_sev_logs and not low_sev_logs:
+                            print("    • No extra evidence found.")
 
-                    if high_sev_logs:
-                        print(" Highly Suspicious:")
-                        for log in high_sev_logs:
-                            print(f"      • {log}")
-                    if low_sev_logs:
-                        print(" Other Suspicious:")
-                        for log in low_sev_logs:
-                            print(f"      • {log}")
-                    if not high_sev_logs and not low_sev_logs:
-                        print("    • No extra evidence found.")
-
-                    print()
-                    choice = input(" Master, do we kill them? (y/n): ")
-                    if choice.lower() == "y":
-                        kill_process(detection['pid'])
+                        print()
+                        choice = input(" Master, do we kill them? (y/n): ")
+                        if choice.lower() == "y":
+                            kill_process(detection['pid'])
 
         time.sleep(5)
 
@@ -464,9 +487,11 @@ def monitor_python_processes():
 if __name__ == "__main__":
     require_root()
     print("We are running.. Press CTRL+C to stop.")
+    lib = load_sus_libraries()
     # print(check_input_access_frequency(3,5,10))
-    # monitor_python_processes()
+    monitor_python_processes(lib)
     # check_network_activity(2915, 5)
-    check_file_activity(161122, 30)
+    # check_file_activity(161122, 30)
+    # print(get_libs_using_mem_maps(44766, lib))
 
 
