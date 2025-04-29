@@ -9,14 +9,14 @@ from inotify_simple import INotify, flags
 from collections import defaultdict
 
 
-COULDBE_SUS_MODULES = [    
+COULDBE_SUS_MODULES = [
     "pyautogui",    # could be used for automation or keylogging
     "pygetwindow",  # Detect active windows
     "ctypes",       # Used for low-level system hooks
     "mss",          # Screenshots
     "PIL",          # Image processing for processing screenshots
-    "socket",       
-    "requests", 
+    "socket",
+    "requests",
     "smtplib",      # Sending logs via email
     "telegram",     # Sending logs via Telegram bot
     "discord",      # Sending logs via Discord bot
@@ -26,6 +26,19 @@ COULDBE_SUS_MODULES = [
     "shutil.copy",  # Copying itself for persistence?
 ]
 
+white_list_paths = [
+    "/usr/bin/",
+    "/usr/sbin/",
+    "/usr/lib/",
+    "/usr/lib64/",
+    "/bin/",
+    "/sbin/",
+    "/lib/",
+    "/lib64/",
+    "/opt/",
+    "/snap/",
+    "/var/lib/snapd/",
+]
 white_list_ports = [8080, 443, 22]
 current_user = os.getlogin()
 suspicious_paths = [
@@ -70,7 +83,7 @@ def load_sus_libraries():
     file_path = "libraries.txt"
     with open(file_path, 'r') as f:
         return [line.strip() for line in f if line.strip()]
-            
+
 
 # this only works if a process reads inputs directly from the events
 def get_active_input_devices(timeout=10):
@@ -95,7 +108,7 @@ def get_active_input_devices(timeout=10):
                 active_devices.add(watch_descriptors[event.wd])
     else:
         print("No input activity detected. Increase the Timeout if needed")
-    
+
     return list(active_devices)
 
 def get_process_using_input_device():
@@ -158,7 +171,7 @@ def check_x11_connection(pid):
             confidence += 1
         if display and display.strip():
             confidence += 1
-       
+
         # modify below?
         for line in subprocess.check_output(['lsof', '-p', str(pid)], stderr=subprocess.DEVNULL).decode().splitlines():
             if 'libX11.so' in line or 'libXt.so' in line:
@@ -182,7 +195,7 @@ def check_input_access_frequency(threshold, timeout):
 
     while time.time() - start_time < timeout:
         pids = get_process_using_input_device()
-        
+
         for proc in psutil.process_iter(['pid']):
             pid = proc.pid
             try:
@@ -218,15 +231,90 @@ def check_input_access_frequency(threshold, timeout):
 # if a process is a gui/background process - keyloggers tend to be in background
 # if a process is using symlinks to mask itself as a legitimate process by using '/usr/bin/'
 # or some paths that are legitimate that we may ignore.
-# if a process is using High cpu or memory usage - I doubt this would be necessary 
+# if a process is using High cpu or memory usage - I doubt this would be necessary
 # if a process opening excessive fd's
 # if a process is running as root(except ours)
-def verify_process(pid):
-    pass
+def verify_process(p):
+    try:
+        sus_score = 0
 
+        name = p.name()
+        user = p.username()
+        fd = p.num_fds()
+        uptime = time.time() - p.create_time()
+        terminal = p.terminal()
+        cwd = p.cwd()
+        full_path = ""
 
-#todo: 
-# if a process is opening sudden connections 
+        if name.startswith('[') and name.endswith(']'):
+            return False
+
+        if cwd == '/':
+            full_path = p.exe()
+        elif len(name) > 1:
+            full_path =  os.path.join(cwd, name[1]) 
+        else:
+            full_path = ""
+        
+        print(full_path)
+        known_safe_names = {
+            "systemd", "dbus-daemon", "NetworkManager", "sshd", "cron",
+            "bash", "zsh", "gnome-shell", "Xorg", "Xwayland"
+        }
+
+        if name in known_safe_names:
+            return False
+
+        safe_prefixes = ("/usr/bin/", "/bin/", "/sbin/", "/usr/sbin/")
+        if full_path.startswith(safe_prefixes):
+            return False
+
+        if full_path in white_list_paths:
+            return False
+
+        if not terminal:
+            sus_score += 1
+
+        if cwd not in white_list_paths:
+            sus_score += 1
+
+        if cwd.startswith('/tmp') or cwd.startswith('/dev'):
+            sus_score += 2
+
+        if os.path.islink(full_path):
+            sus_score += 1
+
+        if fd > 256:
+            sus_score += 1
+
+        if uptime < 300 and not terminal:
+            sus_score += 1  # recently spawned background process
+
+        if user == 'root' and p.pid != os.getpid():
+            sus_score += 1
+
+        return sus_score >= 1
+
+    except Exception:
+        return False
+
+def find_suspicious_processes():
+    suspicious_pids = []
+    c=0
+    for p in psutil.process_iter(['pid']):
+        c+=1
+        if verify_process(p):
+            suspicious_pids.append(p.pid)
+    print(f"Total = {c}")
+    counter = 0
+    for _ in suspicious_pids:
+        counter +=1
+    print(f"After = {counter}")
+    return suspicious_pids
+    
+
+#todo:
+# if a process is opening sudden connections
 # if a process is doing any port-forwarding -> no idea how to approach this
 def check_network_activity(input_pid, timeout):
     conn_count = defaultdict(int)
@@ -249,7 +337,7 @@ def check_network_activity(input_pid, timeout):
             for pid, count in conn_count.items():
                 if pid == i.pid and i.raddr:
                     ip = i.raddr.ip
-                    # not a very effective way - since a process could still 
+                    # not a very effective way - since a process could still
                     # mask as from white listed ports or paths
                     if not ipaddress.ip_address(ip).is_private and i.raddr.port not in white_list_ports:
                         try:
@@ -257,7 +345,7 @@ def check_network_activity(input_pid, timeout):
                             process_name = p.name()
                             path = p.exe()
                             if any(path.startswith(sus_path) for sus_path in suspicious_paths):
-                                print(f"Process - {process_name}, connecting to foreign address - {ip}") 
+                                print(f"Process - {process_name}, connecting to foreign address - {ip}")
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
                             print("Error: Failed to get the process details")
 
@@ -277,7 +365,7 @@ def check_file_activity(pid, timeout):
                 if files.path not in processed:
                     inotify.add_watch(files.path, watch_flags)
                     for _ in inotify.read():
-                        processed.append(files.path) 
+                        processed.append(files.path)
                         # todo fix: Right now it'll always point to the last file from the outer loop
                         print(f"{p_name} with pid [{pid}] actively writing to - {files.path}")
                         return
@@ -310,9 +398,9 @@ def get_modules_using_py_spy(pid, lib):
 def kill_process(pid):
     try:
         p = psutil.Process(pid)
-        p.terminate() 
+        p.terminate()
         p.wait(timeout=5)
-        print(f" Job Done.")
+        print(" Job Done.")
     except psutil.NoSuchProcess:
         print(f"No such process with PID {pid}.")
     except psutil.TimeoutExpired:
@@ -323,7 +411,6 @@ def kill_process(pid):
         print(f"Access denied to kill {pid}.")
 
 # Below 4 functions should only be invoked once we narrow down processes?
-def get_libs_using_mem_maps(pid, lib):
     found_libs = []
     try:
         with open(f"/proc/{pid}/maps", "r") as maps_file:
@@ -387,7 +474,7 @@ def get_modules_using_pmap(pid, libs):
         print("Error: Failed to check output using lsof")
         return []
 
-    
+
 def check_python_imports(pid, lib):
     if pid == CURRENT_PID or pid in DETECTED_PROCESSES:
         return None
@@ -399,21 +486,21 @@ def check_python_imports(pid, lib):
 
         if len(cmdline) > 1:
             detections["path"] = os.path.join(process.cwd(), cmdline[1])
-        
+
         maps = get_libs_using_mem_maps(pid, lib)
-        
+
         if maps:
             for mod in maps:
                 detections["modules"].add(mod)
                 logs.append(f"[maps] Found `{mod}` in /proc/{pid}/maps")
-               
+
         for fd in os.listdir(f"/proc/{pid}/fd"):
             fd_path = os.readlink(f"/proc/{pid}/fd/{fd}")
             for mod in lib:
                 if mod in fd_path:
                     detections["modules"].add(mod)
                     logs.append(f"[fd] Found `{mod}` in file descriptor path")
-         
+
         if detections["path"] and os.path.isfile(detections["path"]):
             sc = read_source_code(lib, detections["path"])
             if sc:
@@ -427,7 +514,7 @@ def check_python_imports(pid, lib):
         return None
 
     except (psutil.AccessDenied, FileNotFoundError, psutil.NoSuchProcess, PermissionError):
-        return None  
+        return None
 
 def calculate_confidence(pid, detection_result, static_logs, lib):
     score = 0
@@ -438,16 +525,16 @@ def calculate_confidence(pid, detection_result, static_logs, lib):
     spy_flag, spy_logs = get_modules_using_py_spy(pid, lib)
 
     check_x11, _ = check_x11_connection(pid)
-    
-    # This only works with python process.. 
+
+    # This only works with python process..
     if check_x11 > 0:
         if spy_flag == True:
-            for logs in spy_logs: 
+            for logs in spy_logs:
                 high_sev_logs.append(f"[Suspicious Activity] X11 input hooks + known suspect modules: {logs}")
-            
+
     for id in active_id:
         p = psutil.Process(id)
-        # Have to implement some furthur checks to differentiate 
+        # Have to implement some furthur checks to differentiate
         # whether this is a System level or a genuine process or a keylogger
         if id != 0:
             path = p.exe()
@@ -535,10 +622,10 @@ if __name__ == "__main__":
     #     mem_file.seek(address)
     #     data = mem_file.read(1024)  # read 1MB
     #     print(data)
-    print(check_input_access_frequency(3,10))
+    # print(check_input_access_frequency(3,10))
     # monitor_python_processes(lib)
     # check_network_activity(2915, 5)
     # check_file_activity(161122, 30)
     # print(get_libs_using_mem_maps(44766, lib))
-
+    print(find_suspicious_processes())
 
