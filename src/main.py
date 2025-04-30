@@ -1,4 +1,5 @@
 import select
+import json
 import psutil
 import os
 import ipaddress
@@ -7,7 +8,7 @@ import sys
 import subprocess
 from inotify_simple import INotify, flags
 from collections import defaultdict
-
+import hashlib
 
 COULDBE_SUS_MODULES = [
     "pyautogui",    # could be used for automation or keylogging
@@ -35,7 +36,6 @@ white_list_paths = [
     "/sbin/",
     "/lib/",
     "/lib64/",
-    "/opt/",
     "/snap/",
     "/var/lib/snapd/",
 ]
@@ -237,29 +237,32 @@ def check_input_access_frequency(threshold, timeout):
 def verify_process(p):
     try:
         sus_score = 0
-
         name = p.name()
         user = p.username()
         fd = p.num_fds()
         uptime = time.time() - p.create_time()
         terminal = p.terminal()
-        cwd = p.cwd()
+        cwd = p.cwd() 
+
+        if os.getpid() == p.pid:
+            return
+
+        cmdline = p.cmdline()
         full_path = ""
+        if cmdline:
+            if len(cmdline) > 1 and os.path.isfile(cmdline[1]):
+                full_path = os.path.abspath(cmdline[1])
+            elif os.path.isfile(cmdline[0]):
+                full_path = os.path.abspath(cmdline[0])
+        else:
+            full_path = p.exe() 
 
         if name.startswith('[') and name.endswith(']'):
             return False
 
-        if cwd == '/':
-            full_path = p.exe()
-        elif len(name) > 1:
-            full_path =  os.path.join(cwd, name[1]) 
-        else:
-            full_path = ""
-        
-        print(full_path)
         known_safe_names = {
-            "systemd", "dbus-daemon", "NetworkManager", "sshd", "cron",
-            "bash", "zsh", "gnome-shell", "Xorg", "Xwayland"
+            "/usr/bin/systemd", "dbus-daemon", "NetworkManager", "sshd", "cron",
+             "/usr/bin/gnome-shell", "/usr/bin/Xorg", "/usr/bin/Xwayland"
         }
 
         if name in known_safe_names:
@@ -275,7 +278,7 @@ def verify_process(p):
         if not terminal:
             sus_score += 1
 
-        if cwd not in white_list_paths:
+        if cwd and cwd not in white_list_paths:
             sus_score += 1
 
         if cwd.startswith('/tmp') or cwd.startswith('/dev'):
@@ -284,34 +287,64 @@ def verify_process(p):
         if os.path.islink(full_path):
             sus_score += 1
 
-        if fd > 256:
+        if fd > 2:
             sus_score += 1
 
         if uptime < 300 and not terminal:
-            sus_score += 1  # recently spawned background process
+            sus_score += 1
 
         if user == 'root' and p.pid != os.getpid():
             sus_score += 1
 
-        return sus_score >= 1
+        if sus_score >= 2:
+            return sus_score, full_path
 
-    except Exception:
-        return False
-
+    except:
+        return
 def find_suspicious_processes():
-    suspicious_pids = []
-    c=0
-    for p in psutil.process_iter(['pid']):
-        c+=1
-        if verify_process(p):
-            suspicious_pids.append(p.pid)
-    print(f"Total = {c}")
-    counter = 0
-    for _ in suspicious_pids:
-        counter +=1
-    print(f"After = {counter}")
-    return suspicious_pids
-    
+    for proc in psutil.process_iter(['pid', 'name']):
+        try:
+            p = psutil.Process(proc.info['pid'])
+            result = verify_process(p)
+            if result:
+                score, path = result
+                hash_and_save(path, p.pid, p.name(), score)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+def hash_and_save(path, pid, name, score):
+    try:
+        h = hashlib.md5()
+        with open(path, 'rb') as f:
+            for data in iter(lambda: f.read(4096), b""):
+                h.update(data)
+        file_hash = h.hexdigest()
+        entry = {
+            "pid": str(pid),
+            "name": name,
+            "path": path,
+            "md5 hash": file_hash,
+            "score": str(score),
+        }
+
+        file_path = "process.json"
+        if os.path.exists(file_path):
+            with open(file_path, "r") as f:
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError:
+                    data = []
+        else:
+            data = []
+
+        if any(entry.get("md5 hash") == file_hash for entry in data):
+            return
+        data.append(entry)
+        with open(file_path, "w") as f:
+            json.dump(data, f, indent=4)
+
+    except Exception as e:
+        print(f"{e}")
 
 #todo:
 # if a process is opening sudden connections
@@ -627,5 +660,5 @@ if __name__ == "__main__":
     # check_network_activity(2915, 5)
     # check_file_activity(161122, 30)
     # print(get_libs_using_mem_maps(44766, lib))
-    print(find_suspicious_processes())
-
+    find_suspicious_processes()
+    # hash_and_save("/home/vamsi/scripts/tsk/full_lenght/gen.sh", 123, "test", 3)
