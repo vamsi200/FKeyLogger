@@ -5,7 +5,7 @@
 #include <unistd.h>
 
 int main(int argc, char *argv[]) {
-  const char *device = "/dev/input/event5";
+  const char *device = "/dev/input/event4";
   int fd = open(device, O_RDONLY);
   if (fd == -1) {
     perror("Failed to open device");
