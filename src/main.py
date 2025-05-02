@@ -9,7 +9,9 @@ import subprocess
 from inotify_simple import INotify, flags
 from collections import defaultdict
 import hashlib
-
+import shutil
+import pwd
+import stat
 COULDBE_SUS_MODULES = [
     "pyautogui",    # could be used for automation or keylogging
     "pygetwindow",  # Detect active windows
@@ -30,15 +32,10 @@ COULDBE_SUS_MODULES = [
 white_list_paths = [
     "/usr/bin/",
     "/usr/sbin/",
-    "/usr/lib/",
-    "/usr/lib64/",
     "/bin/",
     "/sbin/",
-    "/lib/",
-    "/lib64/",
-    "/snap/",
-    "/var/lib/snapd/",
 ]
+
 white_list_ports = [8080, 443, 22]
 current_user = os.getlogin()
 suspicious_paths = [
@@ -227,6 +224,24 @@ def check_input_access_frequency(threshold, timeout):
 
     return suspicious_processes
 
+
+def get_binary_info(full_path):
+    try:
+        pkg_managers = ["apt", "dnf", "yum", "pacman", "zypper", "apk"]
+        for pm in pkg_managers:
+            if shutil.which(pm):
+                if pm == "apt":
+                    result = subprocess.run(["dpkg", "-S", full_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif pm in ["dnf", "yum", "zypper"]:
+                    result = subprocess.run(["rpm", "-qf", full_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif pm == "pacman":
+                    result = subprocess.run(["pacman", "-Qo", full_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif pm == "apk":
+                    result = subprocess.run(["apk", "info", "-W", full_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return result.returncode == 0
+    except:
+        return False
+
 # todo: this will be most important one, will be added to as many functions as possible
 # if a process is a gui/background process - keyloggers tend to be in background
 # if a process is using symlinks to mask itself as a legitimate process by using '/usr/bin/'
@@ -234,6 +249,35 @@ def check_input_access_frequency(threshold, timeout):
 # if a process is using High cpu or memory usage - I doubt this would be necessary
 # if a process opening excessive fd's
 # if a process is running as root(except ours)
+
+def has_suspicious_strings(binary):
+    try:
+        if binary.endswith(('.py', '.sh', '.pl')):
+            with open(binary, 'r', encoding='utf-8', errors='ignore') as f:
+                output = f.read().lower()
+        else:
+            output = subprocess.check_output(["strings", binary], stderr=subprocess.DEVNULL, text=True, timeout=2).lower()
+
+        keywords = ["keylog", "keystroke", "logger", "capture_input", "hook"]
+        return any(kw in output for kw in keywords)
+    except:
+        return False
+
+
+def is_secure_permission(path):
+    try:
+        stat_info = os.stat(path)
+        return not bool(stat_info.st_mode & stat.S_IWOTH)  
+    except:
+        return False
+
+def is_owned_by_root(path):
+    try:
+        stat_info = os.stat(path)
+        return pwd.getpwuid(stat_info.st_uid).pw_name == "root"
+    except:
+        return False
+
 def verify_process(p):
     try:
         sus_score = 0
@@ -242,38 +286,40 @@ def verify_process(p):
         fd = p.num_fds()
         uptime = time.time() - p.create_time()
         terminal = p.terminal()
-        cwd = p.cwd() 
+        cwd = p.cwd()
 
-        if os.getpid() == p.pid:
-            return
-
-        cmdline = p.cmdline()
         full_path = ""
-        if cmdline:
-            if len(cmdline) > 1 and os.path.isfile(cmdline[1]):
-                full_path = os.path.abspath(cmdline[1])
-            elif os.path.isfile(cmdline[0]):
-                full_path = os.path.abspath(cmdline[0])
+        if cwd != '/':
+            try:
+                cmdline = p.cmdline()
+                if cmdline:
+                    if len(cmdline) > 1:
+                        full_path = os.path.join(cwd, cmdline[1])
+            except (psutil.AccessDenied, psutil.NoSuchProcess, IndexError):
+                return
         else:
-            full_path = p.exe() 
+            full_path = p.exe()
+   
+        if not full_path or not os.path.isfile(full_path):
+            return
 
         if name.startswith('[') and name.endswith(']'):
             return False
 
-        known_safe_names = {
-            "/usr/bin/systemd", "dbus-daemon", "NetworkManager", "sshd", "cron",
-             "/usr/bin/gnome-shell", "/usr/bin/Xorg", "/usr/bin/Xwayland"
+        known_safe_paths = {
+            "/usr/bin/systemd", "/usr/bin/dbus-daemon", "/usr/bin/NetworkManager",
+            "/usr/sbin/sshd", "/usr/sbin/crond", "/usr/bin/gnome-shell",
+            "/usr/bin/Xorg", "/usr/bin/Xwayland"
         }
 
-        if name in known_safe_names:
-            return False
+        if full_path in known_safe_paths:
+            if get_binary_info(full_path):
+                sus_score -= 1
 
-        safe_prefixes = ("/usr/bin/", "/bin/", "/sbin/", "/usr/sbin/")
-        if full_path.startswith(safe_prefixes):
-            return False
-
-        if full_path in white_list_paths:
-            return False
+        for wp in white_list_paths:
+            if full_path.startswith(wp):
+                if get_binary_info(full_path):
+                    sus_score -= 1
 
         if not terminal:
             sus_score += 1
@@ -295,22 +341,60 @@ def verify_process(p):
 
         if user == 'root' and p.pid != os.getpid():
             sus_score += 1
-
+        
+        if is_secure_permission(full_path):
+            sus_score -= 1
+        if is_owned_by_root(full_path):
+            sus_score -= 1
+        if has_suspicious_strings(full_path):
+                sus_score += 2
+        else:
+            sus_score-=1
         if sus_score >= 2:
             return sus_score, full_path
 
-    except:
-        return
+    except Exception as e:
+        print(f"{e} - {p}")
+
+CURRENT_SCRIPT_PATH = os.path.realpath(sys.argv[0])
+
 def find_suspicious_processes():
-    for proc in psutil.process_iter(['pid', 'name']):
-        try:
-            p = psutil.Process(proc.info['pid'])
-            result = verify_process(p)
-            if result:
-                score, path = result
-                hash_and_save(path, p.pid, p.name(), score)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+    file_path = "process.json"
+    if not os.path.exists(file_path):
+        with open(file_path, 'w') as f:
+                json.dump([], f)
+
+    for proc in psutil.process_iter(['pid', 'name', 'cwd', 'cmdline', 'exe']):
+        full_path = ""
+        if proc.info['cwd'] != '/':
+            try:
+                cmdline = proc.info['cmdline']
+                if cmdline:
+                    if len(cmdline) > 1:
+                        full_path = os.path.join(proc.info['cwd'], cmdline[1])
+            except (psutil.AccessDenied, psutil.NoSuchProcess, IndexError):
+                return
+        else:
+            full_path = proc.info['exe']
+        
+        if proc.info['pid'] == CURRENT_PID or full_path == CURRENT_SCRIPT_PATH:
             continue
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as f:
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError:
+                    data = []
+            if not any(entry.get("name") == proc.info['name'] and not entry.get("pid") == proc.info['pid'] for entry in data):
+                try:
+                    p = psutil.Process(proc.info['pid'])
+                    result = verify_process(p)
+                    if result:
+                        score, path = result
+                        hash_and_save(path, p.pid, p.name(), score)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
 
 def hash_and_save(path, pid, name, score):
     try:
@@ -343,9 +427,8 @@ def hash_and_save(path, pid, name, score):
         with open(file_path, "w") as f:
             json.dump(data, f, indent=4)
 
-    except Exception as e:
-        print(f"{e}")
-
+    except:
+        return
 #todo:
 # if a process is opening sudden connections
 # if a process is doing any port-forwarding -> no idea how to approach this
@@ -444,6 +527,7 @@ def kill_process(pid):
         print(f"Access denied to kill {pid}.")
 
 # Below 4 functions should only be invoked once we narrow down processes?
+def get_libs_using_mem_maps(pid, lib):
     found_libs = []
     try:
         with open(f"/proc/{pid}/maps", "r") as maps_file:
@@ -648,7 +732,7 @@ def monitor_python_processes(lib):
 if __name__ == "__main__":
     require_root()
     print("We are running.. Press CTRL+C to stop.")
-    lib = load_sus_libraries()
+    # lib = load_sus_libraries()
     # print(get_modules_using_pmap(47460,lib))
     # with open(f"/proc/47460/mem", "rb") as mem_file:
     #     address = 0
