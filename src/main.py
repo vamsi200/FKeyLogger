@@ -11,7 +11,6 @@ from collections import defaultdict
 import hashlib
 import shutil
 import pwd
-import stat
 COULDBE_SUS_MODULES = [
     "pyautogui",    # could be used for automation or keylogging
     "pygetwindow",  # Detect active windows
@@ -38,6 +37,7 @@ white_list_paths = [
 
 white_list_ports = [8080, 443, 22]
 current_user = os.getlogin()
+home_dir = os.path.expanduser('~')
 suspicious_paths = [
     "/tmp/",
     "/var/tmp/",
@@ -263,20 +263,103 @@ def has_suspicious_strings(binary):
     except:
         return False
 
-
-def is_secure_permission(path):
+def get_path(cwd, cmdline, exe_path):
     try:
-        stat_info = os.stat(path)
-        return not bool(stat_info.st_mode & stat.S_IWOTH)  
-    except:
+        logged_in_user = (
+            os.getenv("SUDO_USER") or
+            os.getenv("LOGNAME") or
+            os.getenv("USER") or
+            pwd.getpwuid(os.getuid()).pw_name
+        )
+        user_home = pwd.getpwnam(logged_in_user).pw_dir
+
+        if not cmdline:
+            return False
+
+        if len(cmdline) > 1 and cwd != user_home:
+            candidate_path = os.path.join(cwd, cmdline[1])
+            if os.path.isfile(candidate_path):
+                return candidate_path
+
+        if os.path.isfile(exe_path):
+            return exe_path
+
+        return False
+    except Exception:
         return False
 
-def is_owned_by_root(path):
+CURRENT_SCRIPT_PATH = os.path.realpath(sys.argv[0])
+def skip_current_pid(full_path, pid):
+    return not (pid == CURRENT_PID or full_path == CURRENT_SCRIPT_PATH)
+
+def r_process(p, input_access_pids, sus_libraries):
     try:
-        stat_info = os.stat(path)
-        return pwd.getpwuid(stat_info.st_uid).pw_name == "root"
-    except:
+        pid = p.pid
+        sus_score = 0
+        cwd = p.cwd()
+        cmdline = p.cmdline()
+        exe_path = p.exe()
+        full_path = get_path(cwd, cmdline, exe_path)
+        
+        if not full_path:
+            return False 
+        if p.name().startswith('[') and p.name().endswith(']'):
+            return False
+
+        if skip_current_pid(full_path, pid):
+            if pid in input_access_pids:
+                sus_score += 2
+
+            x11_confidence, x11_rate = check_x11_connection(pid)
+            if x11_confidence >= 2:
+                sus_score += 2
+            elif x11_confidence == 1:
+                sus_score += 1
+
+            try:
+                with open(full_path, 'rb') as f:
+                    binary_data = f.read()
+                    for lib in sus_libraries:
+                        if lib.encode() in binary_data:
+                            sus_score += 1
+                            break
+            except Exception:
+                pass
+
+            if get_binary_info(full_path):
+                sus_score = max(sus_score - 1, 0)
+            else:
+                sus_score += 1
+            
+            if sus_score >= 3:
+                return sus_score, full_path, p.pid
+
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False
+
+known_safe_paths = {
+    "/usr/bin/systemd", "/usr/bin/dbus-daemon", "/usr/bin/NetworkManager",
+    "/usr/sbin/sshd", "/usr/sbin/crond", "/usr/bin/gnome-shell",
+    "/usr/bin/Xorg", "/usr/bin/Xwayland"
+}
+
+# is this a good idea? maybe or maybe not
+safe_process_signatures = set()
+def get_parent_process(p):
+    try:
+        parent_pid = p.ppid()
+        parent_process = psutil.Process(parent_pid)
+        return parent_process
+    except psutil.NoSuchProcess:
+        return None
+
+def is_legitimate_parent(parent_process):
+    if not parent_process:
+        return False
+    known_safe_parents = {
+        'systemd', 'sshd', 'Xorg', 'dbus-daemon', 'NetworkManager'
+    }
+    return parent_process.name() in known_safe_parents
 
 def verify_process(p):
     try:
@@ -289,37 +372,29 @@ def verify_process(p):
         cwd = p.cwd()
 
         full_path = ""
-        if cwd != '/':
-            try:
-                cmdline = p.cmdline()
-                if cmdline:
-                    if len(cmdline) > 1:
-                        full_path = os.path.join(cwd, cmdline[1])
-            except (psutil.AccessDenied, psutil.NoSuchProcess, IndexError):
-                return
-        else:
-            full_path = p.exe()
-   
-        if not full_path or not os.path.isfile(full_path):
-            return
-
-        if name.startswith('[') and name.endswith(']'):
+        try:
+            cmdline = p.cmdline()
+            if cwd != '/' and len(cmdline) > 1:
+                full_path = os.path.join(cwd, cmdline[1])
+            else:
+                full_path = p.exe()
+        except (psutil.AccessDenied, psutil.NoSuchProcess, IndexError):
             return False
 
-        known_safe_paths = {
-            "/usr/bin/systemd", "/usr/bin/dbus-daemon", "/usr/bin/NetworkManager",
-            "/usr/sbin/sshd", "/usr/sbin/crond", "/usr/bin/gnome-shell",
-            "/usr/bin/Xorg", "/usr/bin/Xwayland"
-        }
+        if not full_path or not os.path.isfile(full_path):
+            return False
 
-        if full_path in known_safe_paths:
-            if get_binary_info(full_path):
-                sus_score -= 1
+        if name.startswith('[') and name.endswith(']'):
+            return False  # Kernel threads
+        
+        # not a good idea to just consider as legit process.. will look into it
+        if full_path in known_safe_paths or any(full_path.startswith(wp) for wp in white_list_paths):
+            return False
 
-        for wp in white_list_paths:
-            if full_path.startswith(wp):
-                if get_binary_info(full_path):
-                    sus_score -= 1
+        parent_process = get_parent_process(p)
+        if is_legitimate_parent(parent_process):
+            safe_process_signatures.add(full_path)
+            return False
 
         if not terminal:
             sus_score += 1
@@ -327,7 +402,7 @@ def verify_process(p):
         if cwd and cwd not in white_list_paths:
             sus_score += 1
 
-        if cwd.startswith('/tmp') or cwd.startswith('/dev'):
+        if cwd and (cwd.startswith('/tmp') or cwd.startswith('/dev')):
             sus_score += 2
 
         if os.path.islink(full_path):
@@ -341,22 +416,44 @@ def verify_process(p):
 
         if user == 'root' and p.pid != os.getpid():
             sus_score += 1
-        
-        if is_secure_permission(full_path):
-            sus_score -= 1
-        if is_owned_by_root(full_path):
-            sus_score -= 1
+
         if has_suspicious_strings(full_path):
-                sus_score += 2
+            sus_score += 2
+
+        binary_owned_by_package = get_binary_info(full_path)
+
+        is_path_safe = (
+            full_path in known_safe_paths or
+            any(full_path.startswith(wp) for wp in white_list_paths)
+        )
+
+        if binary_owned_by_package and is_path_safe:
+            sus_score = max(sus_score - 3, 0)
+        elif binary_owned_by_package:
+            sus_score = max(sus_score - 1, 0)
         else:
-            sus_score-=1
-        if sus_score >= 2:
+            sus_score += 1
+
+        try:
+            if p.uids().real == 0 and p.gids().real == 0:
+                sus_score = max(sus_score - 1, 0)
+        except Exception:
+            pass
+
+        try:
+            mem = p.memory_info().rss
+            cpu = p.cpu_percent(interval=0.1)
+            if mem < 10 * 1024 * 1024 and cpu < 1.0 and uptime > 3600:
+                sus_score = max(sus_score - 1, 0)
+        except Exception:
+            pass
+
+        if sus_score >= 3:
             return sus_score, full_path
 
     except Exception as e:
-        print(f"{e} - {p}")
-
-CURRENT_SCRIPT_PATH = os.path.realpath(sys.argv[0])
+        print(f"[Error] {e} - {p}")
+        return False
 
 def find_suspicious_processes():
     file_path = "process.json"
@@ -376,24 +473,22 @@ def find_suspicious_processes():
                 return
         else:
             full_path = proc.info['exe']
-        
-        if proc.info['pid'] == CURRENT_PID or full_path == CURRENT_SCRIPT_PATH:
-            continue
-        if os.path.exists(file_path):
-            with open(file_path, 'r') as f:
-                try:
-                    data = json.load(f)
-                except json.JSONDecodeError:
-                    data = []
-            if not any(entry.get("name") == proc.info['name'] and not entry.get("pid") == proc.info['pid'] for entry in data):
-                try:
-                    p = psutil.Process(proc.info['pid'])
-                    result = verify_process(p)
-                    if result:
-                        score, path = result
-                        hash_and_save(path, p.pid, p.name(), score)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
+        if skip_current_pid(full_path, proc.info['pid']):
+            if os.path.exists(file_path):
+                with open(file_path, 'r') as f:
+                    try:
+                        data = json.load(f)
+                    except json.JSONDecodeError:
+                        data = []
+                if not any(entry.get("name") == proc.info['name'] and not entry.get("pid") == proc.info['pid'] for entry in data):
+                    try:
+                        p = psutil.Process(proc.info['pid'])
+                        result = verify_process(p)
+                        if result:
+                            score, path = result
+                            hash_and_save(path, p.pid, p.name(), score)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
 
 
 def hash_and_save(path, pid, name, score):
@@ -745,4 +840,10 @@ if __name__ == "__main__":
     # check_file_activity(161122, 30)
     # print(get_libs_using_mem_maps(44766, lib))
     find_suspicious_processes()
+    # sus_libraries = load_sus_libraries()
+    # input_access_pids = get_process_using_input_device()
+    # for p in psutil.process_iter():
+    #     result = r_process(p, input_access_pids, sus_libraries)
+    #     if result:
+    #         print("[ALERT] KEYLOGGERRRRRR :", result)
     # hash_and_save("/home/vamsi/scripts/tsk/full_lenght/gen.sh", 123, "test", 3)
