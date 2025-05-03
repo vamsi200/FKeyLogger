@@ -4,6 +4,7 @@
 - !> [!IMPORTANT]
 > Check Network part - done some of it
 
+- Add user Prompt to make a process `trusted`
 - Add Checks -> like precautions:
   checking bashrc, zshrc files
   check if some process is running `history -a` or something like that, i.e logging history to a file
