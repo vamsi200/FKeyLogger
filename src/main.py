@@ -11,6 +11,7 @@ from collections import defaultdict
 import hashlib
 import shutil
 import pwd
+import argparse
 COULDBE_SUS_MODULES = [
     "pyautogui",    # could be used for automation or keylogging
     "pygetwindow",  # Detect active windows
@@ -34,7 +35,7 @@ white_list_paths = [
     "/bin/",
     "/sbin/",
 ]
-
+file_path = "process.json"
 white_list_ports = [8080, 443, 22]
 current_user = os.getlogin()
 home_dir = os.path.expanduser('~')
@@ -83,6 +84,7 @@ def load_sus_libraries():
 
 
 # this only works if a process reads inputs directly from the events
+# have to rethink this approach as well, since this requires the user to be typing something.
 def get_active_input_devices(timeout=10):
     base_path = "/dev/input/by-id/"
     inotify = INotify()
@@ -104,13 +106,13 @@ def get_active_input_devices(timeout=10):
             if event.wd in watch_descriptors:
                 active_devices.add(watch_descriptors[event.wd])
     else:
-        print("No input activity detected. Increase the Timeout if needed")
+        print("No input activity detected. Increase the Timeout if needed [please type something bro]")
 
     return list(active_devices)
 
 def get_process_using_input_device():
     event_paths = get_active_input_devices()
-    all_matches = []
+    pid_event_map = {}
 
     for path in event_paths:
         event_real = os.path.realpath(path)
@@ -126,14 +128,16 @@ def get_process_using_input_device():
                         target = os.readlink(fd_path)
                         target_real = os.path.realpath(target)
                         if target_real == event_real:
-                            all_matches.append(pid)
+                            if pid not in pid_event_map:
+                                pid_event_map[pid] = set()
+                            pid_event_map[pid].add(path)
                             break
                     except Exception:
                         continue
             except Exception:
                 continue
 
-    return all_matches
+    return pid_event_map
 
 # Need to change the unnecessary printing and the slight changes
 def check_x11_connection(pid):
@@ -174,7 +178,7 @@ def check_x11_connection(pid):
             if 'libX11.so' in line or 'libXt.so' in line:
                 confidence += 1
     except Exception as e:
-        print(f"[x] Error analyzing PID {pid}: {e}")
+        print(f"{e}")
         return 0
 
     return confidence,access_rate
@@ -250,7 +254,7 @@ def get_binary_info(full_path):
 # if a process opening excessive fd's
 # if a process is running as root(except ours)
 
-def has_suspicious_strings(binary):
+def has_suspicious_strings(binary, lib):
     try:
         if binary.endswith(('.py', '.sh', '.pl')):
             with open(binary, 'r', encoding='utf-8', errors='ignore') as f:
@@ -258,8 +262,7 @@ def has_suspicious_strings(binary):
         else:
             output = subprocess.check_output(["strings", binary], stderr=subprocess.DEVNULL, text=True, timeout=2).lower()
 
-        keywords = ["keylog", "keystroke", "logger", "capture_input", "hook"]
-        return any(kw in output for kw in keywords)
+        return any(libraries in output for libraries in lib)
     except:
         return False
 
@@ -292,52 +295,124 @@ CURRENT_SCRIPT_PATH = os.path.realpath(sys.argv[0])
 def skip_current_pid(full_path, pid):
     return not (pid == CURRENT_PID or full_path == CURRENT_SCRIPT_PATH)
 
+
+
 def r_process(p, input_access_pids, sus_libraries):
     try:
         pid = p.pid
         sus_score = 0
+        reasons = []
         cwd = p.cwd()
         cmdline = p.cmdline()
         exe_path = p.exe()
         full_path = get_path(cwd, cmdline, exe_path)
-        
-        if not full_path:
-            return False 
-        if p.name().startswith('[') and p.name().endswith(']'):
+        fd = p.num_fds()
+        terminal = p.terminal()
+        uptime = time.time() - p.create_time()
+        user = p.username()
+        check = False  # Default
+
+        if not full_path or not skip_current_pid(full_path, pid):
             return False
 
-        if skip_current_pid(full_path, pid):
-            if pid in input_access_pids:
-                sus_score += 2
+        if pid in input_access_pids:
+            sus_score += 2
+            reasons.append("Accesses input devices")
 
-            x11_confidence, x11_rate = check_x11_connection(pid)
-            if x11_confidence >= 2:
-                sus_score += 2
-            elif x11_confidence == 1:
-                sus_score += 1
+        try:
+            with open(full_path, 'rb') as f:
+                binary_data = f.read()
+                for lib in sus_libraries:
+                    if lib.encode() in binary_data:
+                        sus_score += 1
+                        reasons.append(f"Contains suspicious library: {lib}")
+                        break
+        except Exception:
+            pass
 
-            try:
-                with open(full_path, 'rb') as f:
-                    binary_data = f.read()
-                    for lib in sus_libraries:
-                        if lib.encode() in binary_data:
-                            sus_score += 1
-                            break
-            except Exception:
-                pass
+        if get_binary_info(full_path):
+            sus_score = max(sus_score - 1, 0)
+        else:
+            sus_score += 1
+            reasons.append("Binary not owned by any package")
 
-            if get_binary_info(full_path):
+        parent_process = get_parent_process(p)
+        if is_legitimate_parent(parent_process):
+            safe_process_signatures.add(full_path)
+            return False
+
+        if not terminal:
+            sus_score += 1
+            reasons.append("No controlling terminal")
+
+        if cwd and cwd not in white_list_paths:
+            sus_score += 1
+            reasons.append(f"Running from non-whitelisted path: {cwd}")
+        if cwd and (cwd.startswith('/tmp') or cwd.startswith('/dev')):
+            sus_score += 2
+            reasons.append(f"Running from suspicious dir: {cwd}")
+
+        if os.path.islink(full_path):
+            sus_score += 1
+            reasons.append("Binary is a symlink")
+
+        if fd > 2:
+            sus_score += 1
+            reasons.append(f"Has {fd} file descriptors")
+
+        if uptime < 300 and not terminal:
+            sus_score += 1
+            reasons.append("Recently started and detached")
+
+        if user == 'root' and pid != os.getpid():
+            sus_score += 1
+            reasons.append("Running as root")
+
+        if has_suspicious_strings(full_path, sus_libraries):
+            sus_score += 2
+            reasons.append("Contains suspicious strings")
+
+        if full_path in known_safe_programs or any(full_path.startswith(wp) for wp in white_list_paths):
+            check = True
+            return False
+
+        binary_owned_by_package = get_binary_info(full_path)
+        is_path_safe = (
+            full_path in known_safe_programs or
+            any(full_path.startswith(wp) for wp in white_list_paths)
+        )
+        if binary_owned_by_package and is_path_safe:
+            sus_score = max(sus_score - 3, 0)
+            check = True
+        elif binary_owned_by_package:
+            sus_score = max(sus_score - 2, 0)
+            check = True
+        else:
+            sus_score += 1
+            check = False
+            reasons.append("Binary likely not from a package")
+
+        try:
+            if p.uids().real == 0 and p.gids().real == 0:
                 sus_score = max(sus_score - 1, 0)
-            else:
-                sus_score += 1
-            
-            if sus_score >= 3:
-                return sus_score, full_path, p.pid
+        except Exception:
+            pass
+
+        try:
+            mem = p.memory_info().rss
+            cpu = p.cpu_percent(interval=0.1)
+            if mem < 10 * 1024 * 1024 and cpu < 1.0 and uptime > 3600:
+                sus_score = max(sus_score - 1, 0)
+        except Exception:
+            pass
+
+        if sus_score >= 3:
+            return sus_score, full_path, check, reasons
 
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False
 
-known_safe_paths = {
+known_safe_programs = {
     "/usr/bin/systemd", "/usr/bin/dbus-daemon", "/usr/bin/NetworkManager",
     "/usr/sbin/sshd", "/usr/sbin/crond", "/usr/bin/gnome-shell",
     "/usr/bin/Xorg", "/usr/bin/Xwayland"
@@ -361,137 +436,133 @@ def is_legitimate_parent(parent_process):
     }
     return parent_process.name() in known_safe_parents
 
-def verify_process(p):
-    try:
-        sus_score = 0
-        name = p.name()
-        user = p.username()
-        fd = p.num_fds()
-        uptime = time.time() - p.create_time()
-        terminal = p.terminal()
-        cwd = p.cwd()
-
-        full_path = ""
+# this is supposed to check already trusted processes in background(dont know why) - just to be safe, user could be stupid
+def review_pids():
+    sus_score = 0
+    with open(file_path, 'r') as f:
         try:
-            cmdline = p.cmdline()
-            if cwd != '/' and len(cmdline) > 1:
-                full_path = os.path.join(cwd, cmdline[1])
-            else:
-                full_path = p.exe()
-        except (psutil.AccessDenied, psutil.NoSuchProcess, IndexError):
+            data = json.load(f)
+        except json.JSONDecodeError:
+            data = []
+    for entry in data:
+        if entry.get("is trusted") == True:
+            pass 
+
+reviewed_paths = {}
+#todo: Have to rethink that way we approach this? on user given pid or current one
+def prompt_user(name, path, pid, usage):
+    if path in reviewed_paths:
+        return reviewed_paths[path]    
+
+    print("\nProcess")
+    print(f"PID     : {pid}")
+    print(f"Name    : {name}")
+    print(f"Path    : {path}")
+    print(f"Using   : {usage}\n")
+
+    print("This process is using keyboard input. Do you want to analyze it furture?")
+    print("[1] Yes (Check for suspicious behaviour)")
+    print("[2] No ((Mark this process as legitimate/trusted))")
+
+    while True:
+        choice = input("> ").strip()
+        if choice == '1':
+            reviewed_paths[path] = False
             return False
-
-        if not full_path or not os.path.isfile(full_path):
-            return False
-
-        if name.startswith('[') and name.endswith(']'):
-            return False  # Kernel threads
-        
-        # not a good idea to just consider as legit process.. will look into it
-        if full_path in known_safe_paths or any(full_path.startswith(wp) for wp in white_list_paths):
-            return False
-
-        parent_process = get_parent_process(p)
-        if is_legitimate_parent(parent_process):
-            safe_process_signatures.add(full_path)
-            return False
-
-        if not terminal:
-            sus_score += 1
-
-        if cwd and cwd not in white_list_paths:
-            sus_score += 1
-
-        if cwd and (cwd.startswith('/tmp') or cwd.startswith('/dev')):
-            sus_score += 2
-
-        if os.path.islink(full_path):
-            sus_score += 1
-
-        if fd > 2:
-            sus_score += 1
-
-        if uptime < 300 and not terminal:
-            sus_score += 1
-
-        if user == 'root' and p.pid != os.getpid():
-            sus_score += 1
-
-        if has_suspicious_strings(full_path):
-            sus_score += 2
-
-        binary_owned_by_package = get_binary_info(full_path)
-
-        is_path_safe = (
-            full_path in known_safe_paths or
-            any(full_path.startswith(wp) for wp in white_list_paths)
-        )
-
-        if binary_owned_by_package and is_path_safe:
-            sus_score = max(sus_score - 3, 0)
-        elif binary_owned_by_package:
-            sus_score = max(sus_score - 1, 0)
+        elif choice == '2':
+            print("Marked as trusted.\n")
+            reviewed_paths[path] = True
+            return True
         else:
-            sus_score += 1
+            print("Invalid choice. Please enter 1, 2, or 3.")
 
-        try:
-            if p.uids().real == 0 and p.gids().real == 0:
-                sus_score = max(sus_score - 1, 0)
-        except Exception:
-            pass
+def i_process_checks(pid):
+    found_pids = defaultdict(set)
 
-        try:
-            mem = p.memory_info().rss
-            cpu = p.cpu_percent(interval=0.1)
-            if mem < 10 * 1024 * 1024 and cpu < 1.0 and uptime > 3600:
-                sus_score = max(sus_score - 1, 0)
-        except Exception:
-            pass
+    event_map = get_process_using_input_device()
+    for input_pid, events in event_map.items():
+        for event in events:
+            found_pids[input_pid].add(event)
 
-        if sus_score >= 3:
-            return sus_score, full_path
+    x11_confidence, _ = check_x11_connection(pid)
+    if x11_confidence >= 3:
+        found_pids[pid].add("x11")
 
-    except Exception as e:
-        print(f"[Error] {e} - {p}")
-        return False
+    if pid in found_pids:
+        return True, list(found_pids[pid])
 
-def find_suspicious_processes():
-    file_path = "process.json"
+    return False, None
+
+#todo: Fix, something seems taking long.. 
+def find_suspicious_processes(mode):
     if not os.path.exists(file_path):
         with open(file_path, 'w') as f:
-                json.dump([], f)
+            json.dump([], f)
 
-    for proc in psutil.process_iter(['pid', 'name', 'cwd', 'cmdline', 'exe']):
-        full_path = ""
-        if proc.info['cwd'] != '/':
+    try:
+        with open(file_path, 'r') as f:
             try:
-                cmdline = proc.info['cmdline']
-                if cmdline:
-                    if len(cmdline) > 1:
-                        full_path = os.path.join(proc.info['cwd'], cmdline[1])
-            except (psutil.AccessDenied, psutil.NoSuchProcess, IndexError):
-                return
-        else:
-            full_path = proc.info['exe']
-        if skip_current_pid(full_path, proc.info['pid']):
-            if os.path.exists(file_path):
-                with open(file_path, 'r') as f:
-                    try:
-                        data = json.load(f)
-                    except json.JSONDecodeError:
-                        data = []
-                if not any(entry.get("name") == proc.info['name'] and not entry.get("pid") == proc.info['pid'] for entry in data):
-                    try:
-                        p = psutil.Process(proc.info['pid'])
-                        result = verify_process(p)
+                data = json.load(f)
+            except json.JSONDecodeError:
+                data = []
+    except FileNotFoundError:
+        data = []
+
+    sus_libraries     = load_sus_libraries()
+    input_access_pids = get_process_using_input_device()
+
+    for p in psutil.process_iter():
+        try:
+            if p.name().startswith('[') and p.name().endswith(']'):
+                continue
+
+            full_path = get_path(p.cwd(), p.cmdline(), p.exe())
+            if not full_path or not os.path.isfile(full_path):
+                continue
+
+            if not skip_current_pid(full_path, p.pid):
+                continue
+
+            if any(entry.get("name") == p.name() and entry.get("pid") != p.pid for entry in data):
+                continue
+
+            out, ty = i_process_checks(p.pid)
+            usage   = ""
+
+            if out:
+                if ty == 'x11':
+                    usage = 'x11'
+                elif isinstance(ty, list):
+                    usage = ", ".join(ty)
+
+                if mode != "auto":
+                    trust = prompt_user(p.name(), full_path, p.pid, usage)
+
+                    if not trust:
+                        #todo: fix below bro
+                        print(f"\nAnalyzing process: {p.name()} (PID: {p.pid})\n")
+                        result = r_process(p, input_access_pids, sus_libraries)
                         if result:
-                            score, path = result
-                            hash_and_save(path, p.pid, p.name(), score)
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        continue
+                            score, path, trust, reasons = result
+                            if reasons:
+                                print("Reasons:")
+                                for r in reasons:
+                                    print(f"    - {r}")
+                            else:
+                                print("Process appears legitimate.")
+                            hash_and_save(path, p.pid, p.name(), score, trust)
+                        else:
+                            print("Process appears legitimate. No suspicious indicators found.")
+                else:
+                    result = r_process(p, input_access_pids, sus_libraries)
+                    if result:
+                        score, path, trust, _ = result
+                        hash_and_save(path, p.pid, p.name(), score, trust)
 
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
 
-def hash_and_save(path, pid, name, score):
+def hash_and_save(path, pid, name, score, ist: bool):
     try:
         h = hashlib.md5()
         with open(path, 'rb') as f:
@@ -504,6 +575,7 @@ def hash_and_save(path, pid, name, score):
             "path": path,
             "md5 hash": file_hash,
             "score": str(score),
+            "is trusted": ist 
         }
 
         file_path = "process.json"
@@ -584,11 +656,6 @@ def check_file_activity(pid, timeout):
             print("Error: Failed to get the process details")
             return
         time.sleep(0.0) # you remove, cpu boom
-
-# To check other processes, not only python ones
-def check_loaded_libs(pid):
-    pass
-
 
 
 def get_modules_using_py_spy(pid, lib):
@@ -823,9 +890,15 @@ def monitor_python_processes(lib):
 
         time.sleep(5)
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Keylogger Detector") 
+    parser.add_argument('--mode', choices=['interactive', 'auto'], default='auto', help="'interactive' to prompt user, 'auto' to skip prompts")
+    return parser.parse_args()
 
 if __name__ == "__main__":
     require_root()
+    args = parse_args()
+
     print("We are running.. Press CTRL+C to stop.")
     # lib = load_sus_libraries()
     # print(get_modules_using_pmap(47460,lib))
@@ -839,11 +912,7 @@ if __name__ == "__main__":
     # check_network_activity(2915, 5)
     # check_file_activity(161122, 30)
     # print(get_libs_using_mem_maps(44766, lib))
-    find_suspicious_processes()
-    # sus_libraries = load_sus_libraries()
-    # input_access_pids = get_process_using_input_device()
-    # for p in psutil.process_iter():
-    #     result = r_process(p, input_access_pids, sus_libraries)
-    #     if result:
-    #         print("[ALERT] KEYLOGGERRRRRR :", result)
+    find_suspicious_processes(mode=args.mode)
+    # out = i_process_checks(58695)
+    # review_pids()
     # hash_and_save("/home/vamsi/scripts/tsk/full_lenght/gen.sh", 123, "test", 3)
