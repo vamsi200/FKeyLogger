@@ -12,6 +12,8 @@ import hashlib
 import shutil
 import pwd
 import argparse
+from subprocess import check_output
+
 COULDBE_SUS_MODULES = [
     "pyautogui",    # could be used for automation or keylogging
     "pygetwindow",  # Detect active windows
@@ -34,6 +36,7 @@ white_list_paths = [
     "/usr/sbin/",
     "/bin/",
     "/sbin/",
+    "/usr/lib/"
 ]
 file_path = "process.json"
 white_list_ports = [8080, 443, 22]
@@ -78,9 +81,9 @@ def require_root():
         sys.exit(1)
 
 def load_sus_libraries():
-    file_path = "libraries.txt"
+    file_path = "libraries.json"
     with open(file_path, 'r') as f:
-        return [line.strip() for line in f if line.strip()]
+        return json.load(f)
 
 
 # this only works if a process reads inputs directly from the events
@@ -316,15 +319,15 @@ def r_process(p, input_access_pids, sus_libraries):
             return False
 
         if pid in input_access_pids:
-            sus_score += 2
+            sus_score += 4
             reasons.append("Accesses input devices")
 
         try:
             with open(full_path, 'rb') as f:
                 binary_data = f.read()
-                for lib in sus_libraries:
+                for lib, weight in sus_libraries.items():
                     if lib.encode() in binary_data:
-                        sus_score += 1
+                        sus_score += weight
                         reasons.append(f"Contains suspicious library: {lib}")
                         break
         except Exception:
@@ -333,10 +336,10 @@ def r_process(p, input_access_pids, sus_libraries):
         if get_binary_info(full_path):
             sus_score = max(sus_score - 1, 0)
         else:
-            sus_score += 1
+            sus_score += 2
             reasons.append("Binary not owned by any package")
 
-        parent_process = get_parent_process(p)
+        parent_process = get_parent_process(pid)
         if is_legitimate_parent(parent_process):
             safe_process_signatures.add(full_path)
             return False
@@ -345,12 +348,12 @@ def r_process(p, input_access_pids, sus_libraries):
             sus_score += 1
             reasons.append("No controlling terminal")
 
-        if cwd and cwd not in white_list_paths:
+        if full_path and full_path not in white_list_paths:
             sus_score += 1
-            reasons.append(f"Running from non-whitelisted path: {cwd}")
-        if cwd and (cwd.startswith('/tmp') or cwd.startswith('/dev')):
+            reasons.append(f"Running from non-whitelisted path: {full_path}")
+        if full_path and (full_path.startswith('/tmp') or full_path.startswith('/dev')):
             sus_score += 2
-            reasons.append(f"Running from suspicious dir: {cwd}")
+            reasons.append(f"Running from suspicious dir: {full_path}")
 
         if os.path.islink(full_path):
             sus_score += 1
@@ -420,8 +423,9 @@ known_safe_programs = {
 
 # is this a good idea? maybe or maybe not
 safe_process_signatures = set()
-def get_parent_process(p):
+def get_parent_process(pid):
     try:
+        p = psutil.Process(pid)
         parent_pid = p.ppid()
         parent_process = psutil.Process(parent_pid)
         return parent_process
@@ -449,7 +453,6 @@ def review_pids():
             pass 
 
 reviewed_paths = {}
-#todo: Have to rethink that way we approach this? on user given pid or current one
 def prompt_user(name, path, pid, usage):
     if path in reviewed_paths:
         return reviewed_paths[path]    
@@ -475,6 +478,31 @@ def prompt_user(name, path, pid, usage):
             return True
         else:
             print("Invalid choice. Please enter 1, 2, or 3.")
+
+def read_pid(pid):
+    sus_libraries     = load_sus_libraries()
+    input_access_pids = get_process_using_input_device()
+    try:
+        p = psutil.Process(pid)
+        print(f"\nAnalyzing process: {p.name()} (PID: {pid})\n")
+        result = r_process(p, input_access_pids, sus_libraries)
+        if result:
+            score, path, trust, reasons = result
+            print(f"Suspicion score: {score}/15")
+            if reasons:
+                print("Reasons:")
+                for r in reasons:
+                    print(f"    - {r}")
+            else:
+                print("Process appears legitimate.")
+            hash_and_save(path, p.pid, p.name(), score, trust)
+        else:
+            print("Process appears legitimate. No suspicious indicators found.")
+    except Exception as e:
+        print(f"{e}")
+
+
+
 
 def i_process_checks(pid):
     found_pids = defaultdict(set)
@@ -632,17 +660,111 @@ def check_network_activity(input_pid, timeout):
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
                             print("Error: Failed to get the process details")
 
+
+def check_persistence(pid):
+    try:
+        logged_in_user = (
+            os.getenv("SUDO_USER") or
+            os.getenv("LOGNAME") or
+            os.getenv("USER") or
+            pwd.getpwuid(os.getuid()).pw_name
+        )
+        user_home = pwd.getpwnam(logged_in_user).pw_dir
+        p = psutil.Process(pid)
+        exe_path = p.exe()
+        full_path = get_path(p.cwd(), p.cmdline(), exe_path)
+
+        systemd_dir = os.path.join(user_home, ".config/systemd/user/")
+        if os.path.isdir(systemd_dir):
+            for fname in os.listdir(systemd_dir):
+                if fname.endswith(".service"):
+                    f_path = os.path.join(systemd_dir, fname)
+                    try:
+                        with open(f_path, 'r', errors="ignore") as f:
+                            content = f.read()
+                            if (exe_path and exe_path in content) or (full_path and full_path in content):
+                                return True, f"{full_path or exe_path} is autostarting using systemd"
+                    except Exception as e:
+                        print(f"[systemd read error] {e}")
+
+        autostart_dir = os.path.join(user_home, ".config/autostart/")
+        if os.path.isdir(autostart_dir):
+            for fname in os.listdir(autostart_dir):
+                if fname.endswith(".desktop"):
+                    f_path = os.path.join(autostart_dir, fname)
+                    try:
+                        with open(f_path, 'r', errors="ignore") as f:
+                            content = f.read()
+                            if (exe_path and exe_path in content) or (full_path and full_path in content):
+                                return True, f"{full_path or exe_path} is using autostart"
+                    except Exception as e:
+                        print(f"[autostart read error] {e}")
+
+        startup_files = [".bashrc", ".profile", ".xinitrc"]
+        for sf in startup_files:
+            sf_path = os.path.join(user_home, sf)
+            if os.path.isfile(sf_path):
+                try:
+                    with open(sf_path, 'r', errors="ignore") as f:
+                        content = f.read()
+                        if (exe_path and exe_path in content) or (full_path and full_path in content):
+                            return True, f"{full_path or exe_path} is present in {sf}"
+                except Exception as e:
+                    print(f"[shell file read error] {e}")
+
+        try:
+            crontab_output = check_output(["crontab", "-l"], text=True, stderr=open(os.devnull, 'w'))
+            if (exe_path and exe_path in crontab_output) or (full_path and full_path in crontab_output):
+                return True, f"{full_path or exe_path} is scheduled via crontab"
+        except Exception:
+            pass
+
+        return False, None
+
+    except Exception as e:
+        print(f"{e}")
+        return False, None
+
+def get_sus_parent_process(pid):
+    suspicious_parents = {"cron", "atd", "systemd", "Xorg", "gnome-session", "lightdm", "xdg-autostart"}
+    try:
+        p = psutil.Process(pid)
+        parent = p.parent() if p else None
+        grand_parent = parent.parent() if parent else None #yeah grand parent 
+        if parent and parent.name() in suspicious_parents:
+                return True, f"Suspicious parent process: {parent.name()}"
+        if grand_parent and grand_parent.name() in suspicious_parents:
+            return True, f"Suspicious parent process: {grand_parent.name()}"
+        return False, None
+    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+        print(f"[parent process error] {e}")
+        return False, None
+
+def check_impersonating_process(pid):
+    try:
+        p = psutil.Process(pid)
+        name = p.name()
+        full_path = get_path(p.cwd(), p.cmdline(), p.exe())
+        if full_path:
+            l_path = any(full_path.startswith(p) for p in white_list_paths)
+            if not l_path and name in ["systemd", "bash", "cron", "init", "sshd", "Xorg", "zsh"]:
+                return True, f"Process name impersonates system binary: {name}"
+            return False, None    
+    except Exception as e:
+        print(f"{e}")
+        return False
+
 # goal isn't to check every process.. we narrow down to a one or two processes that we find suspicious and then use this
 def check_file_activity(pid, timeout):
     processed = []
     p_time = time.time()
     inotify = INotify()
     watch_flags = flags.CLOSE_WRITE | flags.MODIFY | flags.CREATE | flags.OPEN
-
+    p = psutil.Process(pid)
+    full_path = get_path(p.cwd(), p.cmdline(), p.exe())
+    print(f"Monitoring Process - {full_path}, timeout set - {timeout}")
     while time.time() - p_time < timeout:
         try:
-            p = psutil.Process(pid)
-            p_name = p.name()
 
             for files in p.open_files():
                 if files.path not in processed:
@@ -650,7 +772,7 @@ def check_file_activity(pid, timeout):
                     for _ in inotify.read():
                         processed.append(files.path)
                         # todo fix: Right now it'll always point to the last file from the outer loop
-                        print(f"{p_name} with pid [{pid}] actively writing to - {files.path}")
+                        print(f"{full_path} with pid [{pid}] actively writing to - {files.path}")
                         return
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             print("Error: Failed to get the process details")
@@ -892,6 +1014,7 @@ def monitor_python_processes(lib):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Keylogger Detector") 
+    parser.add_argument('-p', type=int, help="-p takes an pid for Analyzing")
     parser.add_argument('--mode', choices=['interactive', 'auto'], default='auto', help="'interactive' to prompt user, 'auto' to skip prompts")
     return parser.parse_args()
 
@@ -912,7 +1035,12 @@ if __name__ == "__main__":
     # check_network_activity(2915, 5)
     # check_file_activity(161122, 30)
     # print(get_libs_using_mem_maps(44766, lib))
-    find_suspicious_processes(mode=args.mode)
+    # find_suspicious_processes(mode=args.mode)
+    # read_pid(pid=args.p)
+    # check_file_activity(pid=args.p, timeout=30)
+    # print(check_persistence(51339))
+    # print(get_sus_parent_process(51339))
+    # print(check_impersonating_process(59817))
     # out = i_process_checks(58695)
     # review_pids()
     # hash_and_save("/home/vamsi/scripts/tsk/full_lenght/gen.sh", 123, "test", 3)
