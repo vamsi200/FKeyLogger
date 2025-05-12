@@ -12,8 +12,8 @@ import hashlib
 import shutil
 import pwd
 import argparse
+import atexit
 from subprocess import check_output
-
 COULDBE_SUS_MODULES = [
     "pyautogui",    # could be used for automation or keylogging
     "pygetwindow",  # Detect active windows
@@ -1012,6 +1012,45 @@ def monitor_python_processes(lib):
 
         time.sleep(5)
 
+class BPFMONITOR:
+    def __init__(self):
+        self.proc = None
+        atexit.register(self.stop)
+
+    def start(self):
+        open("bpf_output.txt", "w").close()
+        self.proc = subprocess.Popen(
+            ['sudo', './loader'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+    def stop(self):
+        if self.proc:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except Exception as e:
+                print(f"Error stopping BPF monitor: {e}")
+
+    def check_pid(self, pid, timeout=50):
+        for _ in range(timeout):
+            try:
+                with open("bpf_output.txt", "r") as f:
+                    output = f.read().lower()
+                    if str(pid) in output:
+                        return True
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"File read error: {e}")
+            time.sleep(10)
+        return False
+
+m = BPFMONITOR()
+m.start()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Keylogger Detector") 
     parser.add_argument('-p', type=int, help="-p takes an pid for Analyzing")
@@ -1023,24 +1062,7 @@ if __name__ == "__main__":
     args = parse_args()
 
     print("We are running.. Press CTRL+C to stop.")
-    # lib = load_sus_libraries()
-    # print(get_modules_using_pmap(47460,lib))
-    # with open(f"/proc/47460/mem", "rb") as mem_file:
-    #     address = 0
-    #     mem_file.seek(address)
-    #     data = mem_file.read(1024)  # read 1MB
-    #     print(data)
-    # print(check_input_access_frequency(3,10))
-    # monitor_python_processes(lib)
-    # check_network_activity(2915, 5)
-    # check_file_activity(161122, 30)
-    # print(get_libs_using_mem_maps(44766, lib))
-    # find_suspicious_processes(mode=args.mode)
-    # read_pid(pid=args.p)
-    # check_file_activity(pid=args.p, timeout=30)
-    # print(check_persistence(51339))
-    # print(get_sus_parent_process(51339))
-    # print(check_impersonating_process(59817))
-    # out = i_process_checks(58695)
-    # review_pids()
-    # hash_and_save("/home/vamsi/scripts/tsk/full_lenght/gen.sh", 123, "test", 3)
+    if m.check_pid(608):
+        print("yes")
+    else:
+        print("no")
