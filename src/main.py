@@ -14,6 +14,7 @@ import pwd
 import argparse
 import atexit
 from subprocess import check_output
+import stat
 COULDBE_SUS_MODULES = [
     "pyautogui",    # could be used for automation or keylogging
     "pygetwindow",  # Detect active windows
@@ -754,6 +755,31 @@ def check_impersonating_process(pid):
         print(f"{e}")
         return False
 
+# assuming that a process wont try to hide access to hidraw
+def check_hidraw_connections(pid):
+    try:
+        fd_dir = f"/proc/{pid}/fd"
+        for fd in os.listdir(fd_dir):
+            fd_path = os.path.join(fd_dir, fd)
+            try:
+                target = os.readlink(fd_path)
+                if "/dev/hidraw" in target:
+                    if os.path.exists(target):
+                        st = os.stat(target)
+                        if stat.S_ISCHR(st.st_mode):
+                            return True
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                continue
+            except Exception as e:
+                print(f"Error reading {fd_path}: {e}")
+    except Exception as e:
+        print(f"Failed to read /proc/{pid}/fd: {e}")
+    return False
+
+    
+
 # goal isn't to check every process.. we narrow down to a one or two processes that we find suspicious and then use this
 def check_file_activity(pid, timeout):
     processed = []
@@ -1012,13 +1038,14 @@ def monitor_python_processes(lib):
 
         time.sleep(5)
 
+bpf_file = "bpf_output.json"
 class BPFMONITOR:
     def __init__(self):
         self.proc = None
         atexit.register(self.stop)
 
     def start(self):
-        open("bpf_output.txt", "w").close()
+        open(bpf_file, "w").close()
         self.proc = subprocess.Popen(
             ['sudo', './loader'],
             stdout=subprocess.DEVNULL,
@@ -1036,18 +1063,58 @@ class BPFMONITOR:
     def check_pid(self, pid, timeout=50):
         for _ in range(timeout):
             try:
-                with open("bpf_output.txt", "r") as f:
-                    output = f.read().lower()
-                    if str(pid) in output:
-                        return True
+                with open(bpf_file, "r") as f:
+                    for line in f:
+                        try:
+                            entry = json.loads(line)
+                            if pid == entry.get("pid"):
+                                return True
+                        except Exception as e:
+                            print(f"{e}")
             except FileNotFoundError:
                 pass
             except Exception as e:
-                print(f"File read error: {e}")
+                print(f"{e}")
             time.sleep(10)
         return False
+    
+    def check_hidraw_using_bpf(self, pid, timeout=50):
+        for _ in range(timeout):
+            try:
+                with open(bpf_file, "r") as f:
+                    for line in f:
+                        try:
+                            entry = json.loads(line)
+                            if pid == entry.get("pid") and "hidraw" in entry.get("type"):
+                                return True
+                        except Exception as e:
+                            print(f"{e}")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"{e}")
+            time.sleep(1)
+        return False
 
-m = BPFMONITOR()
+    def check_hiddev(self, pid, timeout=50):
+        for _ in range(timeout):
+            try:
+                with open(bpf_file, "r") as f:
+                    for line in f:
+                        try:
+                            entry = json.loads(line)
+                            if pid == entry.get("pid") and "hiddev" in entry.get("type"):
+                                return True
+                        except Exception as e:
+                            print(f"{e}")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"{e}")
+            time.sleep(1)
+        return False
+
+m = BPFMONITOR() 
 m.start()
 
 
@@ -1062,7 +1129,12 @@ if __name__ == "__main__":
     args = parse_args()
 
     print("We are running.. Press CTRL+C to stop.")
-    if m.check_pid(608):
-        print("yes")
-    else:
-        print("no")
+    # if m.check_pid(630):
+    #     print("yes")
+    # else:
+    #     print("no")
+    # if m.check_hidraw_using_bpf(632, 10):
+    #     print("yes")
+    # else:
+    #     print("no")
+    # print(check_hidraw_connections(45201))
