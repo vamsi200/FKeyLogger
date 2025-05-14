@@ -1,3 +1,4 @@
+from os.path import isdir, isfile
 import select
 import json
 import psutil
@@ -15,6 +16,7 @@ import argparse
 import atexit
 from subprocess import check_output
 import stat
+import glob
 COULDBE_SUS_MODULES = [
     "pyautogui",    # could be used for automation or keylogging
     "pygetwindow",  # Detect active windows
@@ -43,6 +45,7 @@ file_path = "process.json"
 white_list_ports = [8080, 443, 22]
 current_user = os.getlogin()
 home_dir = os.path.expanduser('~')
+
 suspicious_paths = [
     "/tmp/",
     "/var/tmp/",
@@ -74,6 +77,15 @@ suspicious_paths = [
     "/etc/profile.d/"
 ]
 
+def get_user_home():
+    logged_in_user = (
+        os.getenv("SUDO_USER") or
+        os.getenv("LOGNAME") or
+        os.getenv("USER") or
+        pwd.getpwuid(os.getuid()).pw_name
+    )
+    return pwd.getpwnam(logged_in_user).pw_dir
+
 CURRENT_PID = os.getpid()
 DETECTED_PROCESSES = set()
 def require_root():
@@ -89,6 +101,7 @@ def load_sus_libraries():
 
 # this only works if a process reads inputs directly from the events
 # have to rethink this approach as well, since this requires the user to be typing something.
+# TODO: maybe check /proc/bus/input/devices file to get the details. 
 def get_active_input_devices(timeout=10):
     base_path = "/dev/input/by-id/"
     inotify = INotify()
@@ -189,7 +202,7 @@ def check_x11_connection(pid):
 
 # this just returns all the prcoesses that met the condition
 # still we need to differentiate between a legitimate and a suspicious processes
-#todo : maybe in future, change the logic to not use process_iter mutliple times.. just one for all
+# TODO: maybe in future, change the logic to not use process_iter mutliple times.. just one for all
 def check_input_access_frequency(threshold, timeout):
     access_counts = defaultdict(int)
     printed_pids = set()
@@ -272,14 +285,7 @@ def has_suspicious_strings(binary, lib):
 
 def get_path(cwd, cmdline, exe_path):
     try:
-        logged_in_user = (
-            os.getenv("SUDO_USER") or
-            os.getenv("LOGNAME") or
-            os.getenv("USER") or
-            pwd.getpwuid(os.getuid()).pw_name
-        )
-        user_home = pwd.getpwnam(logged_in_user).pw_dir
-
+        user_home = get_user_home()
         if not cmdline:
             return False
 
@@ -441,7 +447,7 @@ def is_legitimate_parent(parent_process):
     }
     return parent_process.name() in known_safe_parents
 
-# this is supposed to check already trusted processes in background(dont know why) - just to be safe, user could be stupid
+# TODO: this is supposed to check already trusted processes in background(dont know why) - just to be safe, user could be stupid
 def review_pids():
     sus_score = 0
     with open(file_path, 'r') as f:
@@ -503,8 +509,6 @@ def read_pid(pid):
         print(f"{e}")
 
 
-
-
 def i_process_checks(pid):
     found_pids = defaultdict(set)
 
@@ -522,7 +526,7 @@ def i_process_checks(pid):
 
     return False, None
 
-#todo: Fix, something seems taking long.. 
+# TODO: Fix, something seems taking long.. 
 def find_suspicious_processes(mode):
     if not os.path.exists(file_path):
         with open(file_path, 'w') as f:
@@ -625,7 +629,7 @@ def hash_and_save(path, pid, name, score, ist: bool):
 
     except:
         return
-#todo:
+#TODO:
 # if a process is opening sudden connections
 # if a process is doing any port-forwarding -> no idea how to approach this
 def check_network_activity(input_pid, timeout):
@@ -664,13 +668,7 @@ def check_network_activity(input_pid, timeout):
 
 def check_persistence(pid):
     try:
-        logged_in_user = (
-            os.getenv("SUDO_USER") or
-            os.getenv("LOGNAME") or
-            os.getenv("USER") or
-            pwd.getpwuid(os.getuid()).pw_name
-        )
-        user_home = pwd.getpwnam(logged_in_user).pw_dir
+        user_home = get_user_home()
         p = psutil.Process(pid)
         exe_path = p.exe()
         full_path = get_path(p.cwd(), p.cmdline(), exe_path)
@@ -797,7 +795,7 @@ def check_file_activity(pid, timeout):
                     inotify.add_watch(files.path, watch_flags)
                     for _ in inotify.read():
                         processed.append(files.path)
-                        # todo fix: Right now it'll always point to the last file from the outer loop
+                        # FIX: Right now it'll always point to the last file from the outer loop
                         print(f"{full_path} with pid [{pid}] actively writing to - {files.path}")
                         return
         except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -901,6 +899,96 @@ def get_modules_using_pmap(pid, libs):
         print("Error: Failed to check output using lsof")
         return []
 
+    
+# TODO: Add an additional prompt to user, if they have any rc files somewhere instead of home directory
+def list_user_rc_files():
+    home = get_user_home()
+    rc_patterns = [
+        ".*rc",               # .bashrc, .zshrc, .cshrc, .inputrc, etc.
+        ".bash_profile",
+        ".profile",
+        ".xinitrc",
+    ]
+    system_files = [
+    "/etc/bash.bashrc",
+    "/etc/zsh/zshrc",
+    "/etc/profile",
+    "/etc/ld.so.preload",
+    ]
+    profile_dir = "/etc/profile.d"
+    files = []
+    for pattern in rc_patterns:
+        files.extend(glob.glob(os.path.join(home, pattern)))
+
+    for s_files in system_files:
+        files.extend(s_files)
+    
+    if os.path.isdir(profile_dir):
+        files.extend(os.path.join(profile_dir, p_files) for p_files in os.listdir(profile_dir))
+            
+    return [f for f in files if os.path.isfile(f)]
+    
+def check_ld_preload(pid, files_to_check):
+    score = 0
+    try:
+        p = psutil.Process(pid)
+        env = p.environ()
+        if "LD_PRELOAD" in env:
+            score += 1
+    except Exception as e:
+        print(f"{e}")
+
+    user_home = get_user_home()
+    for fname in files_to_check:
+        fpath = os.path.join(user_home, fname)
+        if os.path.exists(fpath):
+            try:
+                with open(fpath, "r") as f:
+                    contents = f.read()
+                    if "LD_PRELOAD" in contents or "ld_preload" in contents:
+                        score += 1
+            except Exception as e:
+                print(f"{e}")
+
+    try:
+        if os.path.exists("/etc/ld.so.preload"):
+            with open("/etc/ld.so.preload", "r") as f:
+                contents = f.read().strip()
+                if contents:
+                    score += 1
+    except Exception as e:
+        print(f"{e}")
+
+    return score
+
+sus_files =  ["base64", "eval", "curl", "wget", ".py", "python", "node", "perl"]
+def check_cron_jobs():
+    score = 0
+    cron_dirs = glob.glob("/etc/cron*") + ["/var/spool/cron/", os.path.expanduser("~/.crontab")]
+    cron_files = []
+
+    for path in cron_dirs:
+        if os.path.isfile(path):
+            cron_files.append(path)
+        elif os.path.isdir(path):
+            for filename in os.listdir(path):
+                full_path = os.path.join(path, filename)
+                if os.path.isfile(full_path):
+                    cron_files.append(full_path)
+
+    for file in cron_files:
+        try:
+            with open(file, "r") as f:
+                contents = f.read()
+                for word in suspicious_paths:
+                    if word in contents:
+                        score+=1
+                for word in sus_files:
+                    if word in contents:
+                        score+=1
+        except Exception as e:
+            print(f"{e}")
+    return score
 
 def check_python_imports(pid, lib):
     if pid == CURRENT_PID or pid in DETECTED_PROCESSES:
@@ -1114,8 +1202,8 @@ class BPFMONITOR:
             time.sleep(1)
         return False
 
-m = BPFMONITOR() 
-m.start()
+# m = BPFMONITOR() 
+# m.start()
 
 
 def parse_args():
@@ -1129,6 +1217,9 @@ if __name__ == "__main__":
     args = parse_args()
 
     print("We are running.. Press CTRL+C to stop.")
+    print(check_cron_jobs())
+    # files = list_user_rc_files()
+    # print(check_ld_preload(123, files))
     # if m.check_pid(630):
     #     print("yes")
     # else:
