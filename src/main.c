@@ -10,7 +10,6 @@ struct event_t {
   uint32_t pid;
   uint32_t minor;
   uint32_t major;
-  char type[6];
 };
 
 static FILE *fptr = NULL;
@@ -22,9 +21,8 @@ static void handle_event(void *ctx, int cpu, void *data, unsigned int data_sz) {
   if (!fptr)
     return;
 
-  fprintf(fptr,
-          "{\"pid\": %u, \"major\": %u, \"minor\": %u, \"type\": \"%s\"}\n",
-          ev->pid, ev->major, ev->minor, ev->type);
+  fprintf(fptr, "{\"pid\": %u, \"major\": %u, \"minor\": %u}\n", ev->pid,
+          ev->major, ev->minor);
 }
 
 static void handle_signal(int sig) { running = 0; }
