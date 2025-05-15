@@ -47,27 +47,20 @@ int handle_vfs_read(struct pt_regs *ctx) {
   if (bpf_map_lookup_elem(&seen_pids, &pid))
     return 0;
 
-  if ((major == 13 && minor >= 64 && minor <= 95) || (major < 240)) {
+  // __AUTOGENERATE_DEVICE_FILTER__
+  if ((major == 13 && minor >= 32 && minor <= 35) ||
+      (major == 13 && minor >= 63 && minor <= 90) ||
+      (major == 5 && minor == 0) || (major == 5 && minor == 2) ||
+      (major == 136 && minor >= 0 && minor <= 4) ||
+      (major == 136 && minor == 6) ||
+      (major == 240 && minor >= 0 && minor <= 3)) {
     bpf_map_update_elem(&seen_pids, &pid, &dummy, BPF_ANY);
-
     struct event_t ev = {
         .pid = pid,
         .major = major,
         .minor = minor,
     };
-
-    if (major == 13) {
-      __builtin_memcpy(ev.type, "input", 10);
-    }
-    if (major == 240) {
-      __builtin_memcpy(ev.type, "hidraw", 10);
-    }
-    if (major == 180) {
-      __builtin_memcpy(ev.type, "hiddev", 10);
-    }
-
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &ev, sizeof(ev));
   }
-
   return 0;
 }
