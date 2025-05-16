@@ -1127,6 +1127,8 @@ def monitor_python_processes(lib):
         time.sleep(5)
 
 bpf_file = "bpf_output.json"
+or_file = "test.json"
+
 class BPFMONITOR:
     def __init__(self):
         self.proc = None
@@ -1148,6 +1150,56 @@ class BPFMONITOR:
             except Exception as e:
                 print(f"Error stopping BPF monitor: {e}")
 
+    def get_device_names_from_bpf_file(self):
+        paths = ["/dev/input", "/dev/pts", "/dev/tty"]
+        paths.extend(glob.glob("/dev/hidraw*"))
+        updated_entries = []
+
+        try:
+            with open(bpf_file, "r") as f:
+                lines = f.readlines()
+
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                    major_value = entry.get("major")
+                    minor_value = entry.get("minor")
+                    matched_path = None
+
+                    for base_path in paths:
+                        for root, _, files in os.walk(base_path):
+                            for file in files:
+                                full_path = os.path.join(root, file)
+                                try:
+                                    st = os.stat(full_path)
+                                    if not stat.S_ISCHR(st.st_mode):
+                                        continue
+                                    if (os.major(st.st_rdev) == minor_value and
+                                        os.minor(st.st_rdev) == major_value):
+                                        matched_path = full_path
+                                        break
+                                except Exception:
+                                    continue
+                        if matched_path:
+                            break
+
+                    if matched_path:
+                        entry["device_path"] = matched_path
+
+                    updated_entries.append(entry)
+
+                except json.JSONDecodeError:
+                    continue
+
+            with open(or_file, "w") as out_f:
+                for entry in updated_entries:
+                    out_f.write(json.dumps(entry) + "\n")
+
+        except FileNotFoundError:
+            print(f"[ERROR] File not found: {bpf_file}")
+        except Exception as e:
+            print(f"[ERROR] {e}")
+
     def check_pid(self, pid, timeout=50):
         for _ in range(timeout):
             try:
@@ -1165,44 +1217,28 @@ class BPFMONITOR:
                 print(f"{e}")
             time.sleep(10)
         return False
-    
-    def check_hidraw_using_bpf(self, pid, timeout=50):
+
+    def check_device_type(self, pid, keyword, timeout=50):
         for _ in range(timeout):
             try:
-                with open(bpf_file, "r") as f:
+                with open(or_file, "r") as f:
                     for line in f:
                         try:
                             entry = json.loads(line)
-                            if pid == entry.get("pid") and "hidraw" in entry.get("type"):
-                                return True
+                            d_path = entry.get("device_path", "")
+                            if pid == entry.get("pid") and keyword in d_path:
+                                return True,d_path
                         except Exception as e:
-                            print(f"{e}")
+                            print(f"[WARN] JSON decode error: {e}")
             except FileNotFoundError:
                 pass
             except Exception as e:
-                print(f"{e}")
+                print(f"[ERROR] Failed to open file: {e}")
             time.sleep(1)
         return False
 
-    def check_hiddev(self, pid, timeout=50):
-        for _ in range(timeout):
-            try:
-                with open(bpf_file, "r") as f:
-                    for line in f:
-                        try:
-                            entry = json.loads(line)
-                            if pid == entry.get("pid") and "hiddev" in entry.get("type"):
-                                return True
-                        except Exception as e:
-                            print(f"{e}")
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                print(f"{e}")
-            time.sleep(1)
-        return False
 
-# m = BPFMONITOR() 
+m = BPFMONITOR() 
 # m.start()
 
 
@@ -1217,7 +1253,9 @@ if __name__ == "__main__":
     args = parse_args()
 
     print("We are running.. Press CTRL+C to stop.")
-    print(check_cron_jobs())
+    # print(check_cron_jobs())
+    # f = m.get_device_names_from_bpf_file()
+    # print(m.check_device_type(144971, "input", 5))
     # files = list_user_rc_files()
     # print(check_ld_preload(123, files))
     # if m.check_pid(630):
