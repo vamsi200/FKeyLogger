@@ -116,7 +116,6 @@ def inject_into_bpf(bpf_file="test.bpf.c"):
 
     print(f"[INFO] Injected dynamic device filter data into {bpf_file}.")
 
-#TODO: Take Arguments for updating the C bpf part `--gen` and also take minor value to get the device path `--get ` and default would be `--gen`
 if __name__ == '__main__':
     # inject_into_bpf()
     # print(iter_paths())
