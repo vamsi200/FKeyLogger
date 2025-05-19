@@ -1,4 +1,3 @@
-from os.path import isdir, isfile
 import select
 import json
 import psutil
@@ -17,6 +16,9 @@ import atexit
 from subprocess import check_output
 import stat
 import glob
+import pyudev
+import re
+
 COULDBE_SUS_MODULES = [
     "pyautogui",    # could be used for automation or keylogging
     "pygetwindow",  # Detect active windows
@@ -899,7 +901,98 @@ def get_modules_using_pmap(pid, libs):
         print("Error: Failed to check output using lsof")
         return []
 
-    
+# idea is to find a suspicious input device based on heuristics, - will have to improve in future
+def is_suspicious_input_device():
+    context = pyudev.Context()
+    virtual_event_nodes = set()
+
+    for dev in context.list_devices(subsystem="input"):
+        dev_node = dev.device_node or ""
+        dev_path = dev.device_path or ""
+
+        if not dev.device_node or not dev.device_node.startswith("/dev/input/"):
+            continue
+
+        if not dev_path.startswith("/devices/virtual/input/"):
+            continue
+
+        if dev.get("ID_INPUT_KEY") != "1" and dev.get("ID_INPUT") != "1":
+            continue
+
+        if dev.device_type == "input" or dev.subsystem == "input":
+            continue
+        
+        if dev.get("POWER_SUPPLY_NAME") or dev.get("ID_PATH") == "platform-wmi":
+                continue
+
+        virtual_event_nodes.add(dev_node)
+
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        fd_path = f"/proc/{pid}/fd"
+        if not os.path.isdir(fd_path):
+            continue
+        try:
+            for fd in os.listdir(fd_path):
+                try:
+                    target = os.readlink(os.path.join(fd_path, fd))
+                    if target in virtual_event_nodes:
+                        return (True, target)
+                except:
+                    continue
+        except:
+            continue
+
+    return False
+
+# to check named pipes
+def detect_suspicious_ipc_channels(ignorable_files=None):
+    suspicious_paths = []
+    ipc_dirs = ["/dev/shm", "/tmp", "/run"]
+    current_uid = os.getuid()
+
+    if ignorable_files is None:
+        ignorable_files = []
+
+    for base_path in ipc_dirs:
+        if not os.path.exists(base_path):
+            continue
+
+        for root, _, files in os.walk(base_path, followlinks=False):
+            for name in files:
+                try:
+                    full_path = os.path.join(root, name)
+
+                    if full_path in ignorable_files:
+                        continue
+
+                    st = os.lstat(full_path)
+                    mode = st.st_mode
+
+                    if stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode):
+                        if mode & 0o077:
+                            if st.st_uid == 0 or st.st_uid == current_uid:
+                                suspicious_paths.append(full_path)
+                except Exception:
+                    continue
+
+    return suspicious_paths if suspicious_paths else False
+
+# TODO: Check a file authencity - initially I am just thinking for only detect_suspicious_ipc_channels() function
+# go through every process and check which process is using the file from detect_suspicious_ipc_channels(), 
+# do furthur checks like owner, checking file using pkg managers, hashing etc.
+def check_file_authencity(file_path):
+    pass
+
+# TODO: Check obfuscated_or_packed_binaries because some keyloggers are packed or encrypted to avoid detection from our tool
+# initial idea to use - file, strings, upx to find any hardcoded ip's file paths or commands 
+def check_obfuscated_or_packed_binaries():
+    pass
+
+# TODO: theory is that a malicious file could run in memory without writing to disk
+# we could monitor them using bpf, initial idea is to capture these - memfd_create, execveat
+def check_fileless_execution():
+    pass
+
 # TODO: Add an additional prompt to user, if they have any rc files somewhere instead of home directory
 def list_user_rc_files():
     home = get_user_home()
@@ -1253,6 +1346,8 @@ if __name__ == "__main__":
     args = parse_args()
 
     print("We are running.. Press CTRL+C to stop.")
+    # print(detect_suspicious_ipc_channels("/tmp/optimus-manager"))
+    # print(is_suspicious_input_device())
     # print(check_cron_jobs())
     # f = m.get_device_names_from_bpf_file()
     # print(m.check_device_type(144971, "input", 5))
