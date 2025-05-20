@@ -17,8 +17,7 @@ from subprocess import check_output
 import stat
 import glob
 import pyudev
-import re
-
+import signal
 COULDBE_SUS_MODULES = [
     "pyautogui",    # could be used for automation or keylogging
     "pygetwindow",  # Detect active windows
@@ -281,7 +280,7 @@ def has_suspicious_strings(binary, lib):
         else:
             output = subprocess.check_output(["strings", binary], stderr=subprocess.DEVNULL, text=True, timeout=2).lower()
 
-        return any(libraries in output for libraries in lib)
+        return any(libraries in output for libraries, _ in lib.items())
     except:
         return False
 
@@ -975,23 +974,181 @@ def detect_suspicious_ipc_channels(ignorable_files=None):
                 except Exception:
                     continue
 
-    return suspicious_paths if suspicious_paths else False
+    return set(suspicious_paths) if suspicious_paths else False
 
-# TODO: Check a file authencity - initially I am just thinking for only detect_suspicious_ipc_channels() function
-# go through every process and check which process is using the file from detect_suspicious_ipc_channels(), 
-# do furthur checks like owner, checking file using pkg managers, hashing etc.
-def check_file_authencity(file_path):
-    pass
+#TODO: Will add the Hashing part later.. because the structure of the program is not yet set
+def is_stripped(path):
+    try:
+        output = subprocess.check_output(['file', path], stderr=subprocess.DEVNULL).decode()
+        return 'stripped' in output.lower()
+    except:
+        return False
+
+def check_file_authenticity(file_path):
+    suspicious_dirs = ["/tmp", "/dev/shm", "/var/tmp", "/run", "/home"]
+
+    for proc in psutil.process_iter(['pid', 'open_files', 'cwd', 'exe', 'cmdline']):
+        try:
+            for file in proc.info['open_files'] or []:
+                if str(file_path) in str(file.path):
+                    full_path = get_path(proc.info['cwd'], proc.info['cmdline'], proc.info['exe'])
+                    if not full_path:
+                        return True
+
+                    if "memfd:" in full_path or "(deleted)" in full_path:
+                        return True
+
+                    if not get_binary_info(full_path):
+                        return True
+
+                    if any(full_path.startswith(d) for d in suspicious_dirs):
+                        return True
+
+                    if os.access(full_path, os.W_OK):
+                        return True
+
+                    if is_stripped(full_path):
+                        return True
+
+                    st = os.stat(full_path)
+                    if st.st_uid != 0 or not os.access(full_path, os.X_OK):
+                        return True
+
+                    return False
+        except Exception:
+            continue
+
+    return False                
 
 # TODO: Check obfuscated_or_packed_binaries because some keyloggers are packed or encrypted to avoid detection from our tool
-# initial idea to use - file, strings, upx to find any hardcoded ip's file paths or commands 
+# initial idea to use - file, strings, upx to find any hardcoded ip's file paths or commands
+
+def is_trusted_binary(path):
+    try:
+        if not os.path.exists(path):
+            return False
+
+        st = os.stat(path)
+        trusted_dirs = ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/lib", "/lib64")
+
+        if not path.startswith(trusted_dirs):
+            return False
+
+        if st.st_uid != 0 or (st.st_mode & 0o002):
+            return False
+
+        if not get_binary_info(path):
+            return False
+
+        return True
+
+    except Exception:
+        return False
+
+def is_upx_packed(path):
+    try:
+        output = subprocess.check_output(['upx', '-t', path], stderr=subprocess.DEVNULL).decode()
+        return 'OK' in output
+    except:
+        return False
+
+def is_deleted_on_disk(pid):
+    try:
+        exe_path = os.readlink(f"/proc/{pid}/exe")
+        return "(deleted)" in exe_path
+    except Exception:
+        return False
+
+#FIX: This is not good, I have to research more on this..
 def check_obfuscated_or_packed_binaries():
-    pass
+    flagged = []
+    seen_paths = set()
+    libs = load_sus_libraries()
+
+    for p in psutil.process_iter(['pid', 'name', 'cwd', 'exe', 'cmdline']):
+        try:
+            full_path = get_path(p.info['cwd'], p.info['cmdline'], p.info['exe'])
+            if not full_path or not os.path.exists(full_path):
+                continue
+
+            if is_trusted_binary(full_path):
+                continue
+
+            if not skip_current_pid(full_path, p.pid):
+                continue
+
+            if full_path in seen_paths:
+                continue
+
+            reasons = []
+
+            if is_upx_packed(full_path):
+                reasons.append("upx-packed")
+
+            if has_suspicious_strings(full_path, libs):
+                reasons.append("suspicious-strings")
+
+            if is_deleted_on_disk(p.pid):
+                reasons.append("memory-deleted")
+
+            if reasons:
+                seen_paths.add(full_path)
+                flagged.append({
+                    "pid": p.pid,
+                    "name": p.info['name'],
+                    "path": full_path,
+                    "reasons": reasons
+                })
+
+        except Exception:
+            continue
+
+    return json.dumps(flagged, indent=2) if flagged else json.dumps(False)
 
 # TODO: theory is that a malicious file could run in memory without writing to disk
 # we could monitor them using bpf, initial idea is to capture these - memfd_create, execveat
-def check_fileless_execution():
-    pass
+
+memfd_out_file = "memfd_create_output.json"
+def run_fileless_execution_loader(timeout=50, binary="./fe_loader", out_file=memfd_out_file):
+    open(out_file, "w").close()
+
+    p = subprocess.Popen(
+        ["sudo", binary],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid
+    )
+
+    def terminate():
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+        except Exception:
+            pass
+
+    atexit.register(terminate)
+
+    time.sleep(timeout)
+
+    if p.poll() is None:
+        p.terminate()
+
+def read_memfd_events(out_file=memfd_out_file):
+    pids = []
+
+    try:
+        with open(out_file) as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    pid = data.get("pid")
+                    if pid is not None:
+                        pids.append(pid)
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        pass
+
+    return pids
 
 # TODO: Add an additional prompt to user, if they have any rc files somewhere instead of home directory
 def list_user_rc_files():
@@ -1346,6 +1503,18 @@ if __name__ == "__main__":
     args = parse_args()
 
     print("We are running.. Press CTRL+C to stop.")
+    # run_fileless_execution_loader(10)
+    # pid = read_memfd_events()
+    # if pid:
+    #     print(pid)
+    # print(check_obfuscated_or_packed_binaries())
+    # out = detect_suspicious_ipc_channels()
+    # s = []
+    # if out:
+    #     for file in out:
+    #         rt = check_file_authenticity(file)
+    #         if rt:
+    #             s.append(file)
     # print(detect_suspicious_ipc_channels("/tmp/optimus-manager"))
     # print(is_suspicious_input_device())
     # print(check_cron_jobs())
