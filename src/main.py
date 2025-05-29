@@ -245,8 +245,8 @@ class X11Analyzer:
             for line in subprocess.check_output(['lsof', '-p', str(pid)], stderr=subprocess.DEVNULL).decode().splitlines():
                 if 'libX11.so' in line or 'libXt.so' in line:
                     confidence += 1
-        except Exception as e:
-            print(f"{e}")
+        except:
+            #add the handling bro
             return 0, 0
 
         return confidence, access_rate
@@ -303,7 +303,7 @@ class BinaryAnalyzer:
                 return False
 
             st = os.stat(path)
-            trusted_dirs = ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/lib", "/lib64")
+            trusted_dirs = ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/lib", "/lib64", "/usr/lib")
 
             if not path.startswith(trusted_dirs):
                 return False
@@ -462,32 +462,41 @@ class IPCScanner:
 
 class FileMonitor:
     def check_file_activity(self, pid, timeout):
-        processed = []
-        p_time = time.time()
+        processed_paths = set()
+        start_time = time.time()
         inotify = INotify()
         watch_flags = flags.CLOSE_WRITE | flags.MODIFY | flags.CREATE | flags.OPEN
 
         try:
             p = psutil.Process(pid)
-            full_path = get_path(p.cwd(), p.cmdline(), p.exe())
-            print(f"Monitoring Process - {full_path}, timeout set - {timeout}")
-
-            while time.time() - p_time < timeout:
+            while time.time() - start_time < timeout:
                 try:
-                    for files in p.open_files():
-                        if files.path not in processed:
-                            inotify.add_watch(files.path, watch_flags)
-                            for _ in inotify.read():
-                                processed.append(files.path)
-                                print(f"{full_path} with pid [{pid}] actively writing to - {files.path}")
-                                return
+                    if not p.is_running():
+                        return False
+
+                    for f in p.open_files():
+                        path = f.path
+                        if path not in processed_paths:
+                            try:
+                                inotify.add_watch(path, watch_flags)
+                                processed_paths.add(path)
+                            except Exception as e:
+                                continue
+
+                    events = inotify.read(timeout=100)
+                    if events:
+                        return True  
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    print("Error: Failed to get the process details")
-                    return
+                    print("[ERROR] Could not access process")
+                    return False
 
                 time.sleep(0.0)  # you remove, cpu boom
+            return False
+
         except Exception as e:
-            print(f"[FileMonitor error] {e}")
+            print(f"{e}")
+            return False
+
 
 class ModuleChecker:
     def __init__(self, pid, libs):
@@ -571,53 +580,54 @@ class PersistenceChecker:
             p = psutil.Process(pid)
             exe_path = p.exe()
             full_path = get_path(p.cwd(), p.cmdline(), exe_path)
+            if full_path:
+                systemd_dir = os.path.join(self.user_home, ".config/systemd/user/")
+                if os.path.isdir(systemd_dir):
+                    for fname in os.listdir(systemd_dir):
+                        if fname.endswith(".service"):
+                            f_path = os.path.join(systemd_dir, fname)
+                            try:
+                                with open(f_path, 'r', errors="ignore") as f:
+                                    content = f.read()
+                                    if (exe_path and exe_path in content) or (full_path and full_path in content):
+                                        return True, f"{full_path or exe_path} is autostarting using systemd"
+                            except Exception as e:
+                                print(f"[systemd read error] {e}")
 
-            systemd_dir = os.path.join(self.user_home, ".config/systemd/user/")
-            if os.path.isdir(systemd_dir):
-                for fname in os.listdir(systemd_dir):
-                    if fname.endswith(".service"):
-                        f_path = os.path.join(systemd_dir, fname)
+                autostart_dir = os.path.join(self.user_home, ".config/autostart/")
+                if os.path.isdir(autostart_dir):
+                    for fname in os.listdir(autostart_dir):
+                        if fname.endswith(".desktop"):
+                            f_path = os.path.join(autostart_dir, fname)
+                            try:
+                                with open(f_path, 'r', errors="ignore") as f:
+                                    content = f.read()
+                                    if (exe_path and exe_path in content) or (full_path and full_path in content):
+                                        return True, f"{full_path or exe_path} is using autostart"
+                            except Exception as e:
+                                print(f"[autostart read error] {e}")
+
+                startup_files = [".bashrc", ".profile", ".xinitrc"]
+                for sf in startup_files:
+                    sf_path = os.path.join(self.user_home, sf)
+                    if os.path.isfile(sf_path):
                         try:
-                            with open(f_path, 'r', errors="ignore") as f:
+                            with open(sf_path, 'r', errors="ignore") as f:
                                 content = f.read()
                                 if (exe_path and exe_path in content) or (full_path and full_path in content):
-                                    return True, f"{full_path or exe_path} is autostarting using systemd"
+                                    return True, f"{full_path or exe_path} is present in {sf}"
                         except Exception as e:
-                            print(f"[systemd read error] {e}")
+                            print(f"[shell file read error] {e}")
 
-            autostart_dir = os.path.join(self.user_home, ".config/autostart/")
-            if os.path.isdir(autostart_dir):
-                for fname in os.listdir(autostart_dir):
-                    if fname.endswith(".desktop"):
-                        f_path = os.path.join(autostart_dir, fname)
-                        try:
-                            with open(f_path, 'r', errors="ignore") as f:
-                                content = f.read()
-                                if (exe_path and exe_path in content) or (full_path and full_path in content):
-                                    return True, f"{full_path or exe_path} is using autostart"
-                        except Exception as e:
-                            print(f"[autostart read error] {e}")
+                try:
+                    crontab_output = check_output(["crontab", "-l"], text=True, stderr=open(os.devnull, 'w'))
+                    if (exe_path and exe_path in crontab_output) or (full_path and full_path in crontab_output):
+                        return True, f"{full_path or exe_path} is scheduled via crontab"
+                except Exception:
+                    pass
 
-            startup_files = [".bashrc", ".profile", ".xinitrc"]
-            for sf in startup_files:
-                sf_path = os.path.join(self.user_home, sf)
-                if os.path.isfile(sf_path):
-                    try:
-                        with open(sf_path, 'r', errors="ignore") as f:
-                            content = f.read()
-                            if (exe_path and exe_path in content) or (full_path and full_path in content):
-                                return True, f"{full_path or exe_path} is present in {sf}"
-                    except Exception as e:
-                        print(f"[shell file read error] {e}")
-
-            try:
-                crontab_output = check_output(["crontab", "-l"], text=True, stderr=open(os.devnull, 'w'))
-                if (exe_path and exe_path in crontab_output) or (full_path and full_path in crontab_output):
-                    return True, f"{full_path or exe_path} is scheduled via crontab"
-            except Exception:
-                pass
-
-            return False, None
+            else: 
+                 return False, None
 
         except Exception as e:
             print(f"{e}")
@@ -861,8 +871,6 @@ class BPFMONITOR:
         return False
 
 
-m = BPFMONITOR() 
-
 def get_binary_info(full_path):
     try:
         pkg_managers = ["apt", "dnf", "yum", "pacman", "zypper", "apk"]
@@ -910,133 +918,6 @@ def get_path(cwd, cmdline, exe_path):
     except Exception:
         return False
 
-safe_process_signatures = set()
-def r_process(p, input_access_pids, sus_libraries):
-    try:
-        pid = p.pid
-        sus_score = 0
-        reasons = []
-        cwd = p.cwd()
-        cmdline = p.cmdline()
-        exe_path = p.exe()
-        full_path = get_path(cwd, cmdline, exe_path)
-        fd = p.num_fds()
-        terminal = p.terminal()
-        uptime = time.time() - p.create_time()
-        user = p.username()
-        check = False
-        pv = ParentProcessValidator()
-        pc = PersistenceChecker()
-        bi = BinaryAnalyzer() 
-        if not full_path or not skip_current_pid(full_path, pid):
-            return False
-
-        if pid in input_access_pids:
-            sus_score += 4
-            reasons.append("Accesses input devices")
-
-        try:
-            with open(full_path, 'rb') as f:
-                binary_data = f.read()
-                for lib, weight in sus_libraries.items():
-                    if lib.encode() in binary_data:
-                        sus_score += weight
-                        reasons.append(f"Contains suspicious library: {lib}")
-                        break
-        except Exception as e:
-            print(f"{e}")
-            pass
-        
-        rt, output = pc.check_persistence(pid)
-        if rt:
-            sus_score += 2
-            reasons.append(output)
-
-        if bi.check_file_authenticity(full_path):
-            sus_score += 2
-        
-        if bi.is_upx_packed(full_path) or bi.is_deleted_on_disk(pid):
-            sus_score += 1
-        
-        cron_job_score = pc.check_cron_jobs()
-        if cron_job_score > 1:
-            sus_score += 2
-            
-        parent_process = pv.get_parent_process(pid)
-        if pv.is_legitimate_parent(parent_process):
-            safe_process_signatures.add(full_path)
-            return False
-
-        if not terminal:
-            sus_score += 1
-            reasons.append("No controlling terminal")
-        
-        if full_path and full_path not in white_list_paths:
-            sus_score += 1
-            reasons.append(f"Running from non-whitelisted path: {full_path}")
-        if full_path and (full_path.startswith('/tmp') or full_path.startswith('/dev')):
-            sus_score += 2
-            reasons.append(f"Running from suspicious dir: {full_path}")
-
-        if os.path.islink(full_path):
-            sus_score += 1
-            reasons.append("Binary is a symlink")
-
-        if fd > 2:
-            sus_score += 1
-            reasons.append(f"Has {fd} file descriptors")
-
-        if uptime < 300 and not terminal:
-            sus_score += 1
-            reasons.append("Recently started and detached")
-
-        if user == 'root' and pid != os.getpid():
-            sus_score += 1
-            reasons.append("Running as root")
-
-        if has_suspicious_strings(full_path, sus_libraries):
-            sus_score += 2
-            reasons.append("Contains suspicious strings")
-
-        if full_path in known_safe_programs or any(full_path.startswith(wp) for wp in white_list_paths):
-            check = True
-            return False
-
-        binary_owned_by_package = get_binary_info(full_path)
-        is_path_safe = (
-            full_path in known_safe_programs or
-            any(full_path.startswith(wp) for wp in white_list_paths)
-        )
-        if binary_owned_by_package and is_path_safe:
-            sus_score = max(sus_score - 3, 0)
-            check = True
-        elif binary_owned_by_package:
-            sus_score = max(sus_score - 2, 0)
-            check = True
-        else:
-            sus_score += 1
-            check = False
-            reasons.append("Binary likely not from a package")
-
-        try:
-            if p.uids().real == 0 and p.gids().real == 0:
-                sus_score = max(sus_score - 1, 0)
-        except Exception:
-            pass
-
-        try:
-            mem = p.memory_info().rss
-            cpu = p.cpu_percent(interval=0.1)
-            if mem < 10 * 1024 * 1024 and cpu < 1.0 and uptime > 3600:
-                sus_score = max(sus_score - 1, 0)
-        except Exception:
-            pass
-
-        if sus_score >= 3:
-            return sus_score, full_path, check, reasons
-
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        return False
 
 known_safe_programs = {
     "/usr/bin/systemd", "/usr/bin/dbus-daemon", "/usr/bin/NetworkManager",
@@ -1520,7 +1401,211 @@ def monitor_python_processes(lib):
 
         time.sleep(5)
 
-# m.start()
+safe_process_signatures = set()
+def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, terminal, user, uptime):
+    try:
+        sus_score = 0
+        reasons = []
+        full_path = get_path(cwd, cmdline, exe_path)
+        check = False
+        pv = ParentProcessValidator()
+        pc = PersistenceChecker()
+        bi = BinaryAnalyzer() 
+        if not full_path or not skip_current_pid(full_path, pid):
+            return False
+
+        if pid in input_access_pids:
+            sus_score += 4
+            reasons.append("Accesses input devices")
+
+        try:
+            with open(full_path, 'rb') as f:
+                binary_data = f.read()
+                for lib, weight in sus_libraries.items():
+                    if lib.encode() in binary_data:
+                        sus_score += weight
+                        reasons.append(f"Contains suspicious library: {lib}")
+                        break
+        except Exception as e:
+            print(f"{e}")
+            pass
+        
+        rt, output = pc.check_persistence(pid)
+        if rt:
+            sus_score += 2
+            reasons.append(output)
+
+        if bi.check_file_authenticity(full_path):
+            sus_score += 2
+        
+        if bi.is_upx_packed(full_path) or bi.is_deleted_on_disk(pid):
+            sus_score += 1
+        
+        cron_job_score = pc.check_cron_jobs()
+        if cron_job_score > 1:
+            sus_score += 2
+            
+        parent_process = pv.get_parent_process(pid)
+        if pv.is_legitimate_parent(parent_process):
+            safe_process_signatures.add(full_path)
+            return False
+
+        if not terminal:
+            sus_score += 1
+            reasons.append("No controlling terminal")
+        
+        if full_path and full_path not in white_list_paths:
+            sus_score += 1
+            reasons.append(f"Running from non-whitelisted path: {full_path}")
+        if full_path and (full_path.startswith('/tmp') or full_path.startswith('/dev')):
+            sus_score += 2
+            reasons.append(f"Running from suspicious dir: {full_path}")
+
+        if os.path.islink(full_path):
+            sus_score += 1
+            reasons.append("Binary is a symlink")
+
+        if fd > 2:
+            sus_score += 1
+            reasons.append(f"Has {fd} file descriptors")
+
+        if uptime < 300 and not terminal:
+            sus_score += 1
+            reasons.append("Recently started and detached")
+
+        if user == 'root' and pid != os.getpid():
+            sus_score += 1
+            reasons.append("Running as root")
+
+        if has_suspicious_strings(full_path, sus_libraries):
+            sus_score += 2
+            reasons.append("Contains suspicious strings")
+
+        if full_path in known_safe_programs or any(full_path.startswith(wp) for wp in white_list_paths):
+            check = True
+            return False
+
+        binary_owned_by_package = get_binary_info(full_path)
+        is_path_safe = (
+            full_path in known_safe_programs or
+            any(full_path.startswith(wp) for wp in white_list_paths)
+        )
+        if binary_owned_by_package and is_path_safe:
+            sus_score = max(sus_score - 3, 0)
+            check = True
+        elif binary_owned_by_package:
+            sus_score = max(sus_score - 2, 0)
+            check = True
+        else:
+            sus_score += 1
+            check = False
+            reasons.append("Binary likely not from a package")
+
+        if sus_score >= 3:
+            return sus_score, full_path, check, reasons
+
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+# --scan option 
+def scan_process():
+    i = InputMonitor()
+    bpf = BPFMONITOR()
+    x = X11Analyzer()
+    ba = BinaryAnalyzer()
+    fm = FileMonitor()
+    pc = PersistenceChecker()
+
+    fullpaths = {}  # pid -> binary path
+    suspicious_pids = set()
+    trusted_paths = set()
+    unrecognized_paths = set()
+
+    bpf.start()
+    input_access_pids = i.get_process_using_input_device()
+    
+    suspicious_candidates = set()
+    for p in psutil.process_iter(['pid']):
+        try:
+            confidence, access_rate = x.check_x11_connection(p.pid)
+            if confidence >= 3 and access_rate > 0:
+                suspicious_candidates.add(p.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    
+    for pid in input_access_pids:
+        suspicious_candidates.add(pid)
+        if bpf.check_pid(pid, 1):
+            suspicious_candidates.add(pid)
+
+    bpf.stop()
+
+    for pid in suspicious_candidates:
+        try:
+            proc = psutil.Process(pid)
+            path = get_path(proc.cwd(), proc.cmdline(), proc.exe())
+            if path:
+                fullpaths[pid] = path
+                if ba.is_trusted_binary(path):
+                    trusted_paths.add(path)
+                else:
+                    unrecognized_paths.add(path)
+                    suspicious_pids.add(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    if trusted_paths:
+        print("\n" + "-" * 50)
+        print(" Trusted Processes Using Input Devices".center(50))
+        print("-" * 50)
+        for path in sorted(trusted_paths):
+            print(f" ─ {path}")
+
+    if unrecognized_paths:
+        print("\n" + "-" * 50)
+        print(" Unrecognized Processes Using Input Devices".center(50))
+        print("-" * 50)
+        for path in sorted(unrecognized_paths):
+            print(f" ─ {path}")
+
+    if suspicious_pids:
+        print("\n" + "-" * 50)
+        print(" Running Checks on Unrecognized Processes".center(50))
+        print("-" * 50)
+        checks = [
+            "Process has any suspicious strings",
+            "Process writing to any file",
+            "Process is persistent"
+        ]
+        for c in checks:
+            print(f" ─ {c}")
+
+    for pid in suspicious_pids:
+        if fm.check_file_activity(pid, 1):
+            suspicious_pids.add(pid)
+
+    for pid in suspicious_pids:
+        if pc.check_persistence(pid):
+            suspicious_pids.add(pid)
+
+    for pid in suspicious_pids:
+        path = fullpaths.get(pid)
+        if path and has_suspicious_strings(path, load_sus_libraries()):
+            suspicious_pids.add(pid)
+
+    final_suspects = [pid for pid in suspicious_pids if pid in fullpaths]
+    
+    # Will have to change below output
+    if final_suspects:
+        print("\n" + "-" * 50)
+        print(" POTENTIAL KEYLOGGER(S) DETECTED".center(50))
+        print("-" * 50)
+        for pid in final_suspects:
+            print(f" [PID {pid}]  {fullpaths[pid]}")
+    else:
+        print("\n" + "-" * 50)
+        print(" No suspicious keylogger activity found.".center(50))
+        print("-" * 50)
 
 # Initial stage: go through every running process, do some checks and if our confidence is pretty high and we are certain that it is a legit process then we hash and save it..
 # Second stage: if else, will proceed with furthur checks to confirm if the process is a Keylogger, if yes - then we provide the user with option to kill it - 
@@ -1530,6 +1615,7 @@ def monitor_python_processes(lib):
 # If user is in interactive mode - then we have separate procedure, 
 # default is auto.. we will do all the three stages
 
+# --monitor option
 def phase_one_analysis():
     # First stage: go through every running process
     # Do some static and basic behavioral checks to see if confidence is high
@@ -1547,6 +1633,10 @@ def phase_one_analysis():
             cwd = proc.cwd()
             cmdline = proc.cmdline()
             exe = proc.exe()
+            fd = proc.num_fds()
+            terminal = proc.terminal()
+            username = proc.username()
+            uptime = time.time() - proc.create_time()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
@@ -1556,7 +1646,7 @@ def phase_one_analysis():
                 continue
             full_path_set.add(p)
             pid_list.add(pid)
-        output = r_process(proc, input_access_pids, sus_libraries)
+        output = r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe, fd, terminal, username, uptime)
         if output:
             score, path, trust, reasons = output
             print(score, trust, path, reasons)
@@ -1581,8 +1671,9 @@ if __name__ == "__main__":
     args = parse_args()
     m = BinaryAnalyzer()
     print("We are running.. Press CTRL+C to stop.")
+    scan_process()
     # print(m.is_upx_packed("/opt/zen/zen"))
-    phase_one_analysis()
+    # phase_one_analysis()
     # run_fileless_execution_loader(10)
     # pid = read_memfd_events()
     # if pid:
