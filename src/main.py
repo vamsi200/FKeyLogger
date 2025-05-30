@@ -290,13 +290,6 @@ class ParentProcessValidator:
 
 class BinaryAnalyzer:
     #TODO: Will add the Hashing part later.. because the structure of the program is not yet set
-    def is_stripped(self, path):
-        try:
-            output = subprocess.check_output(['file', path], stderr=subprocess.DEVNULL).decode()
-            return 'stripped' in output.lower()
-        except:
-            return False
-
     def is_trusted_binary(self, path):
         try:
             if not os.path.exists(path):
@@ -332,42 +325,55 @@ class BinaryAnalyzer:
         except Exception:
             return False
 
-    def check_file_authenticity(self, file_path):
+    def check_file_authenticity(self, file_path, full_path, pid=None):
         suspicious_dirs = ["/tmp", "/dev/shm", "/var/tmp", "/run", "/home"]
+        reasons = []
+        st = os.stat(full_path)
 
-        for proc in psutil.process_iter(['pid', 'open_files', 'cwd', 'exe', 'cmdline']):
+        def process_matches(proc):
             try:
-                for file in proc.info['open_files'] or []:
+                for file in proc.open_files():
                     if str(file_path) in str(file.path):
-                        full_path = get_path(proc.info['cwd'], proc.info['cmdline'], proc.info['exe'])
-                        if not full_path:
-                            return True
+                        reasons.append(f"Process {proc.pid} has opened a socket : {file_path}")
+                        return True
 
-                        if "memfd:" in full_path or "(deleted)" in full_path:
-                            return True
+                if "memfd:" in full_path or "(deleted)" in full_path:
+                    reasons.append(f"Executable is memory-loaded or deleted: {full_path}")
+                    return True
 
-                        if not get_binary_info(full_path):
-                            return True
+                if not self.is_trusted_binary(full_path):
+                    reasons.append(f"Untrusted binary path: {full_path}")
+                    return True
 
-                        if any(full_path.startswith(d) for d in suspicious_dirs):
-                            return True
+                if any(full_path.startswith(d) for d in suspicious_dirs):
+                    reasons.append(f"Executable in suspicious directory: {full_path}")
+                    return True
 
-                        if os.access(full_path, os.W_OK):
-                            return True
+                if full_path.startswith(("/usr", "/bin", "/sbin")) and st.st_uid != 0:
+                    reasons.append(f"System binary not owned by root: {full_path}")
+                    return True
 
-                        if self.is_stripped(full_path):
-                            return True
+                if os.access(full_path, os.W_OK) and str(full_path) in suspicious_dirs:
+                    reasons.append(f"Executable is writable: {full_path}")
+                    return True
 
-                        st = os.stat(full_path)
-                        if st.st_uid != 0 or not os.access(full_path, os.X_OK):
-                            return True
+            except Exception as e:
+                reasons.append(f"Exception while analyzing process {proc.pid}: {e}")
+                return False
 
-                        return False
-            except Exception:
-                continue
+        if pid is not None:
+            try:
+                proc = psutil.Process(pid)
+                result = process_matches(proc)
+                return result, reasons if result else []
+            except psutil.NoSuchProcess:
+                return False, [f"PID {pid} does not exist"]
+        else:
+            for proc in psutil.process_iter(['pid']):
+                if process_matches(proc):
+                    return True, reasons
 
-        return False
-
+        return False, []
     #FIX: This is not good, I have to research more on this..
     def check_obfuscated_or_packed_binaries(self, pid=None):
         flagged = []
@@ -768,6 +774,7 @@ class BPFMONITOR:
         atexit.register(self.stop)
 
     def start(self):
+        print("[INFO] Trying to capture input devices using bpf")
         open(bpf_file, "w").close()
         self.proc = subprocess.Popen(
             ['sudo', './loader'],
@@ -833,23 +840,21 @@ class BPFMONITOR:
         except Exception as e:
             print(f"[ERROR] {e}")
 
-    def check_pid(self, pid, timeout=50):
-        for _ in range(timeout):
-            try:
-                with open(bpf_file, "r") as f:
-                    for line in f:
-                        try:
-                            entry = json.loads(line)
-                            if pid == entry.get("pid"):
-                                return True
-                        except Exception as e:
-                            print(f"{e}")
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                print(f"{e}")
-            time.sleep(10)
-        return False
+    def check_pid(self, pid):
+        try:
+            with open(bpf_file, "r") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                        if pid == entry.get("pid") and entry.get("pid") != str(CURRENT_PID):
+                            return True
+                    except Exception as e:
+                        print(f"{e}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"{e}")
+            return False
 
     def check_device_type(self, pid, keyword, timeout=50):
         for _ in range(timeout):
@@ -902,16 +907,27 @@ def has_suspicious_strings(binary, lib):
 
 def get_path(cwd, cmdline, exe_path):
     try:
-        user_home = get_user_home()
         if not cmdline:
             return False
 
-        if len(cmdline) > 1 and cwd != user_home:
-            candidate_path = os.path.join(cwd, cmdline[1])
-            if os.path.isfile(candidate_path):
-                return candidate_path
+        path = None
+        interpreters = ['python', 'python3', 'bash', 'sh', 'perl', 'ruby']
+        basename0 = os.path.basename(cmdline[0])
 
-        if os.path.isfile(exe_path):
+        if basename0 in interpreters and len(cmdline) > 1:
+            path = cmdline[1]
+        else:
+            path = cmdline[0]
+
+        if os.path.isabs(path) and os.path.isfile(path):
+            return path
+
+        if cwd:
+            full_path = os.path.join(cwd, path)
+            if os.path.isfile(full_path):
+                return full_path
+
+        if exe_path and os.path.isfile(exe_path):
             return exe_path
 
         return False
@@ -1435,8 +1451,8 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
             sus_score += 2
             reasons.append(output)
 
-        if bi.check_file_authenticity(full_path):
-            sus_score += 2
+        # if bi.check_file_authenticity(full_path):
+        #     sus_score += 2
         
         if bi.is_upx_packed(full_path) or bi.is_deleted_on_disk(pid):
             sus_score += 1
@@ -1508,19 +1524,20 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
         return False
 
 # --scan option 
-def scan_process():
+def scan_process(is_log=False):
     i = InputMonitor()
     bpf = BPFMONITOR()
     x = X11Analyzer()
     ba = BinaryAnalyzer()
     fm = FileMonitor()
     pc = PersistenceChecker()
-
+    ipc = IPCScanner()
+    sockets = ipc.detect_suspicious_ipc_channels()
     fullpaths = {}  # pid -> binary path
     suspicious_pids = set()
     trusted_paths = set()
     unrecognized_paths = set()
-
+    # log = []
     bpf.start()
     input_access_pids = i.get_process_using_input_device()
     
@@ -1535,37 +1552,50 @@ def scan_process():
     
     for pid in input_access_pids:
         suspicious_candidates.add(pid)
-        if bpf.check_pid(pid, 1):
+        if bpf.check_pid(pid):
             suspicious_candidates.add(pid)
-
+         
+    bpf.get_device_names_from_bpf_file()
     bpf.stop()
-
+    
     for pid in suspicious_candidates:
         try:
             proc = psutil.Process(pid)
             path = get_path(proc.cwd(), proc.cmdline(), proc.exe())
             if path:
                 fullpaths[pid] = path
-                if ba.is_trusted_binary(path):
-                    trusted_paths.add(path)
-                else:
-                    unrecognized_paths.add(path)
-                    suspicious_pids.add(pid)
+                if sockets:
+                    for file in sockets:
+                        result, reasons = ba.check_file_authenticity(file, path, pid)
+                        if not result:
+                            trusted_paths.add(path)
+                        else:
+                            unrecognized_paths.add(path)
+                            suspicious_pids.add(pid)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
+    
+    if trusted_paths:
+        for path in set(trusted_paths):
+           pass 
+
+    #TODO: Have to implement if log given
+    # if is_log:
+    #     for l in log:
+    #         print(l)
 
     if trusted_paths:
         print("\n" + "-" * 50)
         print(" Trusted Processes Using Input Devices".center(50))
         print("-" * 50)
-        for path in sorted(trusted_paths):
+        for path in set(trusted_paths):
             print(f" ─ {path}")
 
     if unrecognized_paths:
         print("\n" + "-" * 50)
         print(" Unrecognized Processes Using Input Devices".center(50))
         print("-" * 50)
-        for path in sorted(unrecognized_paths):
+        for path in set(unrecognized_paths):
             print(f" ─ {path}")
 
     if suspicious_pids:
@@ -1659,11 +1689,14 @@ def phase_one_analysis():
             pass
         
 
-
+# will think about keeping interactive mode or not
 def parse_args():
     parser = argparse.ArgumentParser(description="Keylogger Detector") 
     parser.add_argument('-p', type=int, help="-p takes an pid for Analyzing")
     parser.add_argument('--mode', choices=['interactive', 'auto'], default='auto', help="'interactive' to prompt user, 'auto' to skip prompts")
+    parser.add_argument("--scan", action="store_true", help="Scan Mode")
+    parser.add_argument("--monitor", action="store_true", help="Monitor Mode")
+    parser.add_argument("--log", action="store_true", help="Enable verbose logging")
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -1671,34 +1704,5 @@ if __name__ == "__main__":
     args = parse_args()
     m = BinaryAnalyzer()
     print("We are running.. Press CTRL+C to stop.")
-    scan_process()
-    # print(m.is_upx_packed("/opt/zen/zen"))
-    # phase_one_analysis()
-    # run_fileless_execution_loader(10)
-    # pid = read_memfd_events()
-    # if pid:
-    #     print(pid)
-    # print(check_obfuscated_or_packed_binaries())
-    # out = detect_suspicious_ipc_channels()
-    # s = []
-    # if out:
-    #     for file in out:
-    #         rt = check_file_authenticity(file)
-    #         if rt:
-    #             s.append(file)
-    # print(detect_suspicious_ipc_channels("/tmp/optimus-manager"))
-    # print(is_suspicious_input_device())
-    # print(check_cron_jobs())
-    # f = m.get_device_names_from_bpf_file()
-    # print(m.check_device_type(144971, "input", 5))
-    # files = list_user_rc_files()
-    # print(check_ld_preload(123, files))
-    # if m.check_pid(630):
-    #     print("yes")
-    # else:
-    #     print("no")
-    # if m.check_hidraw_using_bpf(632, 10):
-    #     print("yes")
-    # else:
-    #     print("no")
-    # print(check_hidraw_connections(45201))
+    if args.scan:
+        scan_process(args.log)
