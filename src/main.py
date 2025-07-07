@@ -1,4 +1,3 @@
-import select
 import json
 import psutil
 import os
@@ -93,36 +92,14 @@ def load_sus_libraries():
 # this only works if a process reads inputs directly from the events
 # have to rethink this approach as well, since this requires the user to be typing something.
 class InputMonitor:
-    # TODO: maybe check /proc/bus/input/devices file to get the details.
-    def get_active_input_devices(self, timeout=10):
-        base_path = "/dev/input/by-id/"
-        inotify = INotify()
-        watch_descriptors = {}
-
-        for f_name in os.listdir(base_path):
-            f_path = os.path.join(base_path, f_name)
-            try:
-                link = os.path.realpath(f_path)
-                wd = inotify.add_watch(link, flags.ACCESS | flags.MODIFY | flags.OPEN)
-                watch_descriptors[wd] = link
-            except Exception as e:
-                print(f"Error reading {f_path}: {e}")
-        active_devices = set()
-        rlist, _, _ = select.select([inotify.fileno()], [], [], timeout)
-
-        if rlist:
-            for event in inotify.read():
-                if event.wd in watch_descriptors:
-                    active_devices.add(watch_descriptors[event.wd])
-        else:
-            print("No input activity detected. Increase the Timeout if needed [please type something bro]")
-
-        return list(active_devices)
+    def get_active_input_devices(self):
+        base = "/dev/input/"
+        return [os.path.join(base, f) for f in os.listdir(base) if f.startswith("event")]
 
     def get_process_using_input_device(self):
         event_paths = self.get_active_input_devices()
         pid_event_map = {}
-
+        
         for path in event_paths:
             event_real = os.path.realpath(path)
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -759,7 +736,7 @@ class BPFMONITOR:
         atexit.register(self.stop)
 
     def start(self, timeout):
-        print("[INFO] Trying to capture active input devices using bpf") 
+        print("[INFO] Trying to capture processes using input devices with - BPF")
         open(bpf_file, "w").close()
         self.proc = subprocess.Popen(
             ['sudo', './loader'],
@@ -1568,6 +1545,7 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
 # check active connections to a private ip address
 def scan_process(is_log=False):
     i = InputMonitor()
+    input_access_pids = i.get_process_using_input_device()
     bpf = BPFMONITOR()
     x = X11Analyzer()
     ba = BinaryAnalyzer()
@@ -1581,68 +1559,72 @@ def scan_process(is_log=False):
     parent_map = {}
     reasons_by_pid = defaultdict(set)
     suspicious_candidates = set()
-    input_access_pids = i.get_process_using_input_device()
-
-    print("[INFO] Starting Suspicious Process Scan")
-
-    for p in psutil.process_iter(['pid', 'ppid']):
-        try:
-            confidence, access_rate = x.check_x11_connection(p.pid)
-            if confidence >= 3 and access_rate > 0:
-                suspicious_candidates.add(p.pid)
-                reasons_by_pid[p.pid].add("X11 access")
-            parent_map[p.pid] = p.ppid()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-
-    for pid in input_access_pids:
-        suspicious_candidates.add(pid)
-        reasons_by_pid[pid].add("input access")
-        if bpf.check_pid(pid):
-            reasons_by_pid[pid].add("BPF activity")
-    bpf.stop()
-
     trusted_paths = set()
     unrecognized_paths = set()
     suspicious_pids = set()
+    bpf.stop()
 
-    for pid in suspicious_candidates:
-        try:
-            proc = psutil.Process(pid)
-            path = get_path(proc.cwd(), proc.cmdline(), proc.exe())
-            if path:
-                fullpaths[pid] = path
-                if sockets:
-                    for file in sockets:
-                        result, reason_list = ba.check_file_authenticity(file, path, pid)
-                        if not result:
-                            trusted_paths.add(path)
-                        else:
-                            unrecognized_paths.add(path)
-                            suspicious_pids.add(pid)
-                            for reason in reason_list:
-                                reasons_by_pid[pid].add(reason)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+    print("[INFO] Starting Suspicious Process Scan")
 
-    check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm)
+    try:
+        for p in psutil.process_iter(['pid', 'ppid']):
+            try:
+                confidence, access_rate = x.check_x11_connection(p.pid)
+                if confidence >= 3 and access_rate > 0:
+                    suspicious_candidates.add(p.pid)
+                    reasons_by_pid[p.pid].add("X11 access")
+                parent_map[p.pid] = p.ppid()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
 
-def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm):
-    if trusted_paths:
+        for pid in input_access_pids:
+            suspicious_candidates.add(pid)
+            reasons_by_pid[pid].add("input access")
+            if bpf.check_pid(pid):
+                reasons_by_pid[pid].add("BPF activity")
+
+        for pid in suspicious_candidates:
+            try:
+                proc = psutil.Process(pid)
+                path = get_path(proc.cwd(), proc.cmdline(), proc.exe())
+                if path:
+                    fullpaths[pid] = path
+                    if sockets:
+                        for file in sockets:
+                            result, reason_list = ba.check_file_authenticity(file, path, pid)
+                            if not result:
+                                trusted_paths.add(path)
+                            else:
+                                unrecognized_paths.add(path)
+                                suspicious_pids.add(pid)
+                                for reason in reason_list:
+                                    reasons_by_pid[pid].add(reason)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=True)
+    except KeyboardInterrupt:
+        print("\n[INFO] Scan interrupted by user. Exiting...")
+
+
+def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False):
+    previously_printed_pids = set()
+
+    if trusted_paths and scan:
         print("\n" + "-" * 50)
         print(" Trusted Processes Using Input Devices ".center(50))
         print("-" * 50)
         for path in sorted(set(trusted_paths)):
             print(f" ─ {path}")
 
-    if unrecognized_paths:
+    if unrecognized_paths and scan:
         print("\n" + "-" * 50)
         print(" Unrecognized Processes Using Input Devices ".center(50))
         print("-" * 50)
         for path in sorted(set(unrecognized_paths)):
             print(f" ─ {path}")
 
-    if suspicious_pids:
+    if suspicious_pids and scan:
         print("\n" + "-" * 50)
         print(" Running Checks on Unrecognized Processes ".center(50))
         print("-" * 50)
@@ -1702,7 +1684,7 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
         else:
             printed_pids.add(pid)
 
-    if printed_pids:
+    if printed_pids and scan:
         print("\n" + "-" * 50)
         print(" POTENTIAL KEYLOGGER(S) DETECTED ".center(50))
         print("-" * 50)
@@ -1735,10 +1717,34 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
                         print(f"         • {reason}")
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     print(f" [PID {pid}]  <process info unavailable>")
-    else:
+    elif printed_pids and scan:
         print("\n" + "-" * 50)
         print(" No suspicious keylogger activity found. ".center(50))
         print("-" * 50)
+  
+    else:
+        print("\n")
+        print("POTENTIAL KEYLOGGER(S) DETECTED:")
+        for pid_group in [high_sus_string_pids, printed_pids - set(high_sus_string_pids)]:
+            for pid in sorted(pid_group):
+                path = fullpaths.get(pid, '[unknown path]')
+                binary = os.path.basename(path)
+
+                ppid = parent_map.get(pid, None)
+                parent_path = '[unknown]'
+                if ppid:
+                    try:
+                        parent = psutil.Process(ppid)
+                        parent_path = os.path.basename(parent.exe())
+                    except Exception:
+                        pass
+
+                print(f"[PID {pid}] {binary} - {parent_path}")
+                reason_list = sorted(reasons_by_pid.get(pid, []))
+                for reason in reason_list:
+                    print(f"     └─ {reason}")
+                print("\n")
+
 
 def pid_is_trusted(pid):
     if not os.path.isfile(file_path):
@@ -1762,75 +1768,120 @@ def pid_is_trusted(pid):
 # just to be sure
 
 # --monitor option
-def phase_one_analysis():
-    import sys
-    non_s_process = set()
+def phase_one_analysis(interval=5):
     pid_list = set()
     i = InputMonitor()
     input_access_pids = i.get_process_using_input_device()
     sus_libraries = load_sus_libraries()
-    path_list = set()
-    
-    print("[INFO] Starting Phase 1 analysis")
-    print("[INFO] Scanning PID - ", end='', flush=True)
+    parent_map = {}
+    path_check = set()
+    bpf = BPFMONITOR()
 
-    for proc in psutil.process_iter(['pid', 'cmdline', 'exe', 'cwd']):
-        pid = proc.info['pid']
+    print("[INFO] Starting analysis..")
+    print(f"[INFO] Scan interval - {interval}s")
+    print("[INFO] Monitoring processes for suspicious activity...")
+    
+    while True:
+        bpf.start(5)
+        bpf.stop()
+       
+        for proc in psutil.process_iter(['pid', 'cmdline', 'exe', 'cwd']):
+            pid = proc.info['pid']
+            try:
+                cwd = proc.cwd()
+                cmdline = proc.cmdline()
+                exe = proc.exe()
+                fd = proc.num_fds()
+                terminal = proc.terminal()
+                username = proc.username()
+                name = proc.name()
+                uptime = time.time() - proc.create_time()
+                parent_map[proc.pid] = proc.ppid()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+            p = get_path(cwd, cmdline, exe)
+            if p:
+                if not skip_current_pid(p, pid):
+                    continue
+                pid_list.add(pid)
+
+            if not pid_is_trusted(pid):
+                sys.stdout.write(f"\033[1G")
+                sys.stdout.write(f"[INFO] Scanning PID - {pid:<6}")
+                output = r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe, fd, terminal, username, uptime)
+
+                if output:
+                    _, path, _, reasons = output
+                    if path not in path_check:
+                        path_check.add(path)
+                        phase_two_analysis(pid, path, reasons, parent_map, input_access_pids)
+                else:
+                    if p:
+                        hash_and_save(p, pid, name, 0, True)
+                sys.stdout.flush()
+
+        print(f"\n[INFO] Sleeping - {interval}s")
+        time.sleep(interval)
+
+def change_and_join(reasons):
+    if isinstance(reasons, (list, tuple)):
+        return " ".join(map(str, reasons))
+    return str(reasons)
+
+def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids):
+    bpf = BPFMONITOR()
+    x = X11Analyzer()
+    ba = BinaryAnalyzer()
+    fm = FileMonitor()
+    pc = PersistenceChecker()
+    ipc = IPCScanner()
+    nm = NetworkMonitor()
+    sockets = ipc.detect_suspicious_ipc_channels()
+    fullpaths = {}
+    parent_map = {}
+    reasons_by_pid = defaultdict(set)
+    suspicious_candidates = set()
+    trusted_paths = set()
+    unrecognized_paths = set()
+    suspicious_pids = set()
+
+    for r in reasons:
+        reasons_by_pid[pid].add(change_and_join(r))
+
+    confidence, access_rate = x.check_x11_connection(pid)
+    if confidence >= 3 and access_rate > 0:
+        suspicious_candidates.add(pid)
+        reasons_by_pid[pid].add("X11 access")
+
+    for pid in input_access_pids:
+        suspicious_candidates.add(pid)
+        reasons_by_pid[pid].add("input access")
+        if bpf.check_pid(pid):
+            reasons_by_pid[pid].add("BPF activity")
+
+    for pid in suspicious_candidates:
         try:
-            cwd = proc.cwd()
-            cmdline = proc.cmdline()
-            exe = proc.exe()
-            fd = proc.num_fds()
-            terminal = proc.terminal()
-            username = proc.username()
-            name = proc.name()
-            uptime = time.time() - proc.create_time()
+            proc = psutil.Process(pid)
+            path = get_path(proc.cwd(), proc.cmdline(), proc.exe())
+            if path:
+                fullpaths[pid] = path
+                if sockets:
+                    for file in sockets:
+                        result, reason_list = ba.check_file_authenticity(file, path, pid)
+                        if not result:
+                            trusted_paths.add(path)
+                        else:
+                            unrecognized_paths.add(path)
+                            suspicious_pids.add(pid)
+                            for reason in reason_list:
+                                reasons_by_pid[pid].add(reason)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-
-        p = get_path(cwd, cmdline, exe)
-        if p:
-            if not skip_current_pid(p, pid):
-                continue
-            pid_list.add(pid)
-
-        if not pid_is_trusted(pid):
-            sys.stdout.write(f"\033[1G")
-            sys.stdout.write(f"[INFO] Scanning PID - {pid:<6}")
-
-            output = r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe, fd, terminal, username, uptime)
-            if output:
-                score, path, trust, reasons = output
-                print(f"[INFO] Running More scans on - {pid:<6}")
-                phase_two_analysis(pid, score, path, trust, reasons)
-            else:
-                if p:
-                    hash_and_save(p, pid, name, 0, True)
-            sys.stdout.flush()
-
-def phase_two_analysis(pid, score, path, trust, reasons):
-    # i = InputMonitor()
-    # bpf = BPFMONITOR()
-    # x = X11Analyzer()
-    # ba = BinaryAnalyzer()
-    # fm = FileMonitor()
-    # pc = PersistenceChecker()
-    # ipc = IPCScanner()
-    # nm = NetworkMonitor()
-    # bpf.start(5)
-    # sockets = ipc.detect_suspicious_ipc_channels()
-    # fullpaths = {}
-    # parent_map = {}
-    # reasons_by_pid = defaultdict(set)
-    # suspicious_candidates = set()
-    # input_access_pids = i.get_process_using_input_device()
     
-    m_reasons = []
-    for r in reasons:
-        m_reasons.append(r)
+    check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False)
 
 
-        
 
 # will think about keeping interactive mode or not
 def parse_args():
@@ -1846,7 +1897,6 @@ if __name__ == "__main__":
     require_root()
     args = parse_args()
     m = BinaryAnalyzer()
-    print("We are running.. Press CTRL+C to stop.")
     if args.scan:
         try:
             scan_process(args.log)
