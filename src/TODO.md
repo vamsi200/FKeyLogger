@@ -1,6 +1,4 @@
 - inject into a running python process and get its modules like gdb -> nope not a good idea buddy => because it could crash things. We are using py-spy as an alt for now
-- Add proper logging
-- We are only checking python files. We have to up our game
 - !> [!IMPORTANT]
 > Check Network part - done some of it
 
@@ -17,10 +15,10 @@
 
 IMPORTANT:
 - Add No Trust Process option during the scanning and monitoring.
-- Default scan should give an option to Trust certain processes.
+- An option to Trust certain processes - done.
 - Add log option to reasons for more verbose reasoning
 - Add log, explaining why a process is trusted
-
+- Add a initial setup flow, that get all the details about input devices etc..
 
 - Maybe in way future, implement sandboxing?
 
