@@ -14,7 +14,7 @@
   PAM abuse
 
 IMPORTANT:
-- Add No Trust Process option during the scanning and monitoring.
+- Add No Trust Process option during the scanning and monitoring - done.
 - An option to Trust certain processes - done.
 - Add log option to reasons for more verbose reasoning
 - Add log, explaining why a process is trusted
