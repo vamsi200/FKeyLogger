@@ -423,7 +423,7 @@ class IPCScanner:
                     except Exception:
                         continue
 
-        return set(suspicious_paths) if suspicious_paths else False
+        return set(suspicious_paths)
 
 class FileMonitor:
     def check_file_activity(self, pid, timeout):
@@ -833,6 +833,7 @@ def get_binary_info(full_path):
         pkg_managers = ["apt", "dnf", "yum", "pacman", "zypper", "apk"]
         for pm in pkg_managers:
             if shutil.which(pm):
+                result = None
                 if pm == "apt":
                     result = subprocess.run(["dpkg", "-S", full_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 elif pm in ["dnf", "yum", "zypper"]:
@@ -841,9 +842,12 @@ def get_binary_info(full_path):
                     result = subprocess.run(["pacman", "-Qo", full_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 elif pm == "apk":
                     result = subprocess.run(["apk", "info", "-W", full_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return result.returncode == 0
-    except:
+                if result is not None:
+                    return result.returncode == 0
         return False
+    except Exception:
+        return False
+
 
 def has_suspicious_modules(binary, lib) -> bool:
     def lines():
@@ -944,7 +948,7 @@ known_safe_programs = {
 
 # TODO: this is supposed to check already trusted processes in background(dont know why) - just to be safe, user could be stupid
 def review_pids():
-    sus_score = 0
+    # sus_score = 0
     with open(file_path, 'r') as f:
         try:
             data = json.load(f)
@@ -1003,7 +1007,10 @@ def hash_and_save(path, pid, name, score, ist: bool):
     try:
         h = hashlib.md5()
         with open(path, 'rb') as f:
-            for data in iter(lambda: f.read(4096), b""):
+            while True:
+                data = f.read(4096)
+                if not data:
+                    break
                 h.update(data)
         file_hash = h.hexdigest()
         entry = {
@@ -1076,33 +1083,21 @@ def check_hidraw_connections(pid):
 
 
 def kill_process(pid):
+    p = None
     try:
         p = psutil.Process(pid)
         p.terminate()
         p.wait(timeout=5)
-        print(" Job Done.")
+        print("Job Done.")
     except psutil.NoSuchProcess:
         print(f"No such process with PID {pid}.")
     except psutil.TimeoutExpired:
-        p.kill()
-        print(f"Timeout: Process {pid} did not terminate within the timeout.")
-        print(f"Process {pid} forcefully terminated.")
+        if p:
+            p.kill()
+            print(f"Timeout: Process {pid} did not terminate within the timeout.")
+            print(f"Process {pid} forcefully terminated.")
     except psutil.AccessDenied:
         print(f"Access denied to kill {pid}.")
-
-
-# def read_source_code(lib, path):
-#     found_libs = []
-#     try:
-#         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-#             content = f.read().lower()
-#             for mod in lib:
-#                 if mod in content and mod not in found_libs:
-#                     found_libs.append(mod)
-#         return found_libs
-#     except(FileNotFoundError, PermissionError):
-#         print("Error: Failed to read maps")
-#         return []
 
 
 # idea is to find a suspicious input device based on heuristics, - will have to improve in future
