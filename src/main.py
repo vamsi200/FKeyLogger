@@ -67,7 +67,7 @@ CURRENT_PID = os.getpid()
 DETECTED_PROCESSES = set()
 
 def skip_current_pid(full_path, pid):
-    return not (pid == CURRENT_PID or full_path == CURRENT_SCRIPT_PATH)
+    return (pid == CURRENT_PID or full_path == CURRENT_SCRIPT_PATH)
 
 def get_user_home():
     logged_in_user = (
@@ -305,7 +305,7 @@ class BinaryAnalyzer:
                     return True
 
                 if any(full_path.startswith(d) for d in suspicious_dirs):
-                    reasons.append(f"Executable in suspicious directory: {full_path}")
+                    reasons.append(f"Executable in suspicious direaccess ctory: {full_path}")
                     return True
 
                 if full_path.startswith(("/usr", "/bin", "/sbin")) and st.st_uid != 0:
@@ -361,7 +361,7 @@ class BinaryAnalyzer:
                 if self.is_trusted_binary(full_path):
                     continue
 
-                if not skip_current_pid(full_path, p_info['pid']):
+                if skip_current_pid(full_path, p_info['pid']):
                     continue
 
                 if full_path in seen_paths:
@@ -694,6 +694,7 @@ class NetworkMonitor:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 print("Error: Failed to get the process details")
                 return
+            
             for i in conn:
                 if i.status == 'ESTABLISHED' and i.raddr and i.pid:
                     conn_count[i.pid] += 1
@@ -711,9 +712,10 @@ class NetworkMonitor:
                                 path = p.exe()
                                 if any(path.startswith(sus_path) for sus_path in suspicious_paths):
                                     return True, ip
+                                return False, None
                             except (psutil.NoSuchProcess, psutil.AccessDenied):
                                 print("Error: Failed to get the process details")
-                                return False
+                                return False, None
 
 bpf_file = "bpf_output.json"
 or_file = "test.json"
@@ -849,7 +851,7 @@ def get_binary_info(full_path):
         return False
 
 
-def has_suspicious_modules(binary, lib) -> bool:
+def has_suspicious_modules(binary, lib):
     def lines():
         try:
             if binary.endswith(('.py', '.sh', '.pl')):
@@ -871,13 +873,13 @@ def has_suspicious_modules(binary, lib) -> bool:
         for line in lines():
             for libraries, weight in lib.items():
                 if str(libraries) in str(line):
-                    return weight
-        return False
+                    return libraries, weight
+        return None, 0
     except Exception:
-        return False
+        return None, 0
 
 def has_suspicious_strings(binary_path):
-    suspicious_markers = [
+    sus_names = [
         b"/dev/input/event",
         b"XOpenDisplay",
         b"XQueryKeymap",
@@ -903,12 +905,12 @@ def has_suspicious_strings(binary_path):
     try:
         with open(binary_path, 'rb') as f:
             content = f.read()
-            for marker in suspicious_markers:
-                if marker in content:
-                    return True
+            for name in sus_names:
+                if name in content:
+                    return True, name
     except Exception as e:
         print(f"    [ERROR] Failed to scan {binary_path}: {e}")
-    return False
+    return False, None
 
 def get_path(cwd, cmdline, exe_path):
     try:
@@ -1002,6 +1004,22 @@ def i_process_checks(pid):
         return True, list(found_pids[pid])
 
     return False, None
+
+def get_file_hash(path):
+    try:
+        h = hashlib.md5()
+        with open(path, 'rb') as f:
+                while True:
+                    data = f.read(4096)
+                    if not data:
+                        break
+                    h.update(data)
+        file_hash = h.hexdigest()
+        return file_hash
+    
+    except Exception as e:
+        print(f"[ERROR] Failed to hash: {e}")
+        return False
 
 def hash_and_save(path, pid, name, score, ist: bool):
     try:
@@ -1232,7 +1250,7 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
         pv = ParentProcessValidator()
         pc = PersistenceChecker()
         bi = BinaryAnalyzer() 
-        if not full_path or not skip_current_pid(full_path, pid):
+        if not full_path or skip_current_pid(full_path, pid):
             return False
 
         if pid in input_access_pids:
@@ -1297,9 +1315,10 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
             sus_score += 1
             reasons.append("Running as root")
 
-        if has_suspicious_modules(full_path, sus_libraries):
+        libraries, rt = has_suspicious_modules(full_path, sus_libraries)
+        if rt:
             sus_score += 2
-            reasons.append("Contains suspicious strings")
+            reasons.append(f"Contains suspicious strings: {libraries}")
 
         if full_path in known_safe_programs or any(full_path.startswith(wp) for wp in white_list_paths):
             check = True
@@ -1400,8 +1419,6 @@ def scan_process(is_log=False, target_pid=None):
                             result, reason_list = ba.check_file_authenticity(file, path, target_pid)
                             if not result:
                                 trusted_paths.add(path)
-                                if is_log:
-                                    print(f"[LOG] Trusted binary detected: {path} (PID {target_pid})")
                             else:
                                 unrecognized_paths.add(path)
                                 suspicious_pids.add(target_pid)
@@ -1450,8 +1467,6 @@ def scan_process(is_log=False, target_pid=None):
                                 result, reason_list = ba.check_file_authenticity(file, path, pid)
                                 if not result:
                                     trusted_paths.add(path)
-                                    if is_log:
-                                        print(f"[LOG] Trusted binary detected: {path} (PID {pid})")
                                 else:
                                     unrecognized_paths.add(path)
                                     suspicious_pids.add(pid)
@@ -1482,7 +1497,7 @@ def scan_process(is_log=False, target_pid=None):
 
 
 
-def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False, s_pid=False):
+def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False, s_pid=False, is_log_enabled=False):
     if trusted_paths and scan and not s_pid:
         print("\n" + "-" * 50)
         print(" Trusted Processes Using Input Devices ".center(50))
@@ -1512,20 +1527,24 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
 
     for pid in list(suspicious_pids):
         if fm.check_file_activity(pid, 1):
-            reasons_by_pid[pid].add("file I/O")
+            reasons_by_pid[pid].add("Has file Input/Output")
 
     for pid in list(suspicious_pids):
-        if pc.check_persistence(pid):
-            reasons_by_pid[pid].add("is persistent")
+        rt, out = pc.check_persistence(pid)
+        if rt:
+            reasons_by_pid[pid].add(f"is persistent: {out}")
 
     for pid in list(suspicious_pids):
-        if nm.check_network_activity(pid, 5):
-            reasons_by_pid[pid].add("has foreign connections")
+        rt, ip = nm.check_network_activity(pid, 5)
+        if rt and ip:
+            reasons_by_pid[pid].add(f"has foreign connections: {ip}")
 
     for pid in list(suspicious_pids):
         path = fullpaths.get(pid)
-        if path and has_suspicious_strings(path):
-            reasons_by_pid[pid].add("has suspicious strings")
+        if path:
+            rt, string_name = has_suspicious_strings(path)
+            if rt and string_name:
+                reasons_by_pid[pid].add(f"has suspicious strings: {string_name}")
 
     high_sus_string_pids = []
     normal_suspects = []
@@ -1535,16 +1554,17 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
     for pid in suspicious_pids:
         path = fullpaths.get(pid)
         if path:
-            sus_score = has_suspicious_modules(path, load_sus_libraries())
+            module_name, sus_score = has_suspicious_modules(path, load_sus_libraries())
             sus_scores[pid] = sus_score
-            if sus_score >= 4:
-                high_sus_string_pids.append(pid)
-                reasons_by_pid[pid].add("has suspicious modules")
-            elif sus_score > 0:
-                normal_suspects.append(pid)
-                reasons_by_pid[pid].add("has suspicious modules")
-            else:
-                normal_suspects.append(pid)
+            if sus_score and module_name:
+                if sus_score >= 4:
+                    high_sus_string_pids.append(pid)
+                    reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
+                elif sus_score > 0:
+                    normal_suspects.append(pid)
+                    reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
+                else:
+                    normal_suspects.append(pid)
 
     final_suspects = list(set(high_sus_string_pids + normal_suspects))
     final_suspects = [pid for pid in final_suspects if pid in fullpaths]
@@ -1667,7 +1687,7 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
 
 
 
-def pid_is_trusted(pid):
+def pid_is_trusted(pid, hash):
     if not os.path.isfile(file_path):
         return False
     try:
@@ -1677,8 +1697,8 @@ def pid_is_trusted(pid):
         return False
     
     for entry in data:
-            if entry.get("pid") == str(pid) and entry.get("is trusted") is True:
-                return True
+        if entry.get("pid") == str(pid) or entry.get("md5 hash") == str(hash) and entry.get("is trusted") is True:
+            return True
 
 
 # Initial stage: go through every running process, do some checks and if our confidence is pretty high and we are certain that it is a legit process then we hash and save it..
@@ -1688,10 +1708,16 @@ def pid_is_trusted(pid):
 # just to be sure
 
 # --monitor option
-def phase_one_analysis(interval=5, is_log_enabled=False):
+def phase_one_analysis(interval=5, is_log_enabled=False, scan_all=False):
     print("[INFO] Starting monitoring..")
     print(f"[INFO] Scan interval - {interval}s")
     print("[INFO] Monitoring processes for suspicious activity..")
+
+    if is_log_enabled:
+        if scan_all:
+            print("[LOG] Scanning all processes, including those marked as trusted.")
+        else:
+            print("[LOG] Skipping processes trusted by program heuristics or user configuration.")
 
 
     while True:
@@ -1703,9 +1729,6 @@ def phase_one_analysis(interval=5, is_log_enabled=False):
         bpf.start(5)
         bpf.stop()
         path_check = set()
-        pid_list = set()
-        proceesed = set()
-     
         for proc in psutil.process_iter(['pid', 'cmdline', 'exe', 'cwd']):
             pid = proc.info['pid']
             try:
@@ -1722,25 +1745,39 @@ def phase_one_analysis(interval=5, is_log_enabled=False):
                 continue
 
             p = get_path(cwd, cmdline, exe)
-            if p:
-                if not skip_current_pid(p, pid):
-                    continue
-                pid_list.add(pid)
+            if not p or skip_current_pid(p, pid):
+                continue
 
-            if not pid_is_trusted(pid):
+            if not scan_all:
+                file_hash = get_file_hash(p)
+                if not pid_is_trusted(pid, file_hash):
+                    sys.stdout.write(f"\033[1G")
+                    sys.stdout.write(f"[INFO] Scanning the PID - {pid:<6}")
+                    output = r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe, fd, terminal, username, uptime)
+
+                    if output and pid:
+                        _, path, _, reasons = output
+                        if path not in path_check:
+                            path_check.add(path)
+                            phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log_enabled)
+                    else:
+                        if p:
+                            if not hash_and_save(p, pid, name, 0, True):
+                                print(f"[ERROR] Failed to update {file_path}")
+                    sys.stdout.flush()
+            else:
                 sys.stdout.write(f"\033[1G")
                 sys.stdout.write(f"[INFO] Scanning PID - {pid:<6}")
                 output = r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe, fd, terminal, username, uptime)
 
-                if output and pid not in proceesed:
+                if output and pid:
                     _, path, _, reasons = output
                     if path not in path_check:
                         path_check.add(path)
-                        proceesed.add(pid)
                         phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log_enabled)
                 else:
                     if p:
-                        if not hash_and_save(p, pid, name, 0, True):
+                        if not hash_and_save(p, pid, name, 0, False):
                             print(f"[ERROR] Failed to update {file_path}")
                 sys.stdout.flush()
 
@@ -1754,7 +1791,7 @@ def change_and_join(reasons):
 
 def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log_enabled=False):
     if is_log_enabled:
-        print(f"[LOG] Starting phase two analysis for PID - {pid}.")
+        print(f"\n[LOG] Starting phase two analysis for PID - {pid}.")
 
     bpf = BPFMONITOR()
     x = X11Analyzer()
@@ -1773,8 +1810,8 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
     unrecognized_paths = set()
     suspicious_pids = set()
     
-    # if is_log_enabled:
-    #     print(f"[LOG] Detected {len(sockets)} suspicious IPC socket(s).")
+    if is_log_enabled:
+        print(f"[LOG] Detected {len(sockets)} suspicious IPC socket(s).")
 
     for r in reasons:
         reasons_by_pid[pid].add(change_and_join(r))
@@ -1784,7 +1821,7 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
         suspicious_candidates.add(pid)
         reasons_by_pid[pid].add("Has X11 access")
         if is_log_enabled:
-            print(f"[LOG] Using X11 to access Input devices with (confidence: {confidence}, rate: {access_rate})")
+            print(f"[LOG] Using X11 to access Input devices with (confidence: {confidence}, access rate: {access_rate})")
 
     for pid, input_device_path in input_access_pids.items():
         suspicious_candidates.add(pid)
@@ -1873,6 +1910,12 @@ def parse_args():
     parser.add_argument("--monitor", action="store_true", help="Monitor Mode")
     parser.add_argument("--modify_trust", action="store_true", help="Modifies/Adds trust to a process")
     parser.add_argument("--log", action="store_true", help="Enable verbose logging")
+    parser.add_argument(
+    "--all",
+    action="store_true",
+    help="By default, trusted processes (based on heuristics or user input) are skipped. "
+         "Use this flag to disable that behavior and scan all processes, including the trusted ones."
+)
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -1886,7 +1929,7 @@ if __name__ == "__main__":
             print("\n[INFO] Scan interrupted by user. Exiting...")
     if args.monitor:
         try:
-            phase_one_analysis(10, args.log)
+            phase_one_analysis(10, args.log, args.all)
         except KeyboardInterrupt:
             print("\n[INFO] Scan interrupted by user. Exiting...")
     if args.p:
