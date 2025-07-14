@@ -18,6 +18,7 @@ import glob
 import pyudev
 import signal
 from datetime import datetime
+import re
 
 file_path = "process.json"
 white_list_ports = [8080, 443, 22]
@@ -562,52 +563,67 @@ class ModuleChecker:
             return []
 
 class PersistenceChecker:
-    def __init__(self):
-        self.user_home = os.path.expanduser("~")
+    def get_existing_user_homes(self):
+        user_homes = []
+
+        if os.path.isdir("/root"):
+            user_homes.append("/root")
+
+        if os.path.isdir("/home"):
+            for name in os.listdir("/home"):
+                path = os.path.join("/home", name)
+                if os.path.isdir(path):
+                    user_homes.append(path)
+
+        return user_homes
 
     def check_persistence(self, pid):
+        user_home = self.get_existing_user_homes()
         try:
             p = psutil.Process(pid)
             exe_path = p.exe()
             full_path = get_path(p.cwd(), p.cmdline(), exe_path)
             if full_path:
-                systemd_dir = os.path.join(self.user_home, ".config/systemd/user/")
-                if os.path.isdir(systemd_dir):
-                    for fname in os.listdir(systemd_dir):
-                        if fname.endswith(".service"):
-                            f_path = os.path.join(systemd_dir, fname)
-                            try:
-                                with open(f_path, 'r', errors="ignore") as f:
-                                    content = f.read()
-                                    if (exe_path and exe_path in content) or (full_path and full_path in content):
-                                        return True, f"{full_path or exe_path} is autostarting using systemd"
-                            except Exception as e:
-                                print(f"[systemd read error] {e}")
-
-                autostart_dir = os.path.join(self.user_home, ".config/autostart/")
-                if os.path.isdir(autostart_dir):
-                    for fname in os.listdir(autostart_dir):
-                        if fname.endswith(".desktop"):
-                            f_path = os.path.join(autostart_dir, fname)
-                            try:
-                                with open(f_path, 'r', errors="ignore") as f:
-                                    content = f.read()
-                                    if (exe_path and exe_path in content) or (full_path and full_path in content):
-                                        return True, f"{full_path or exe_path} is using autostart"
-                            except Exception as e:
-                                print(f"[autostart read error] {e}")
+                for home in user_home:
+                    systemd_dir = os.path.join(home, ".config/systemd/user/")
+                    if os.path.isdir(systemd_dir):
+                        for fname in os.listdir(systemd_dir):
+                            if fname.endswith(".service"):
+                                f_path = os.path.join(systemd_dir, fname)
+                                try:
+                                    with open(f_path, 'r', errors="ignore") as f:
+                                        content = f.read()
+                                        if (exe_path and exe_path in content) or (full_path and full_path in content):
+                                            return True, f"{full_path or exe_path} is autostarting using systemd"
+                                except Exception as e:
+                                    print(f"[systemd read error] {e}")
+                
+                for home in user_home:
+                    autostart_dir = os.path.join(home, ".config/autostart/")
+                    if os.path.isdir(autostart_dir):
+                        for fname in os.listdir(autostart_dir):
+                            if fname.endswith(".desktop"):
+                                f_path = os.path.join(autostart_dir, fname)
+                                try:
+                                    with open(f_path, 'r', errors="ignore") as f:
+                                        content = f.read()
+                                        if (exe_path and exe_path in content) or (full_path and full_path in content):
+                                            return True, f"{full_path or exe_path} is using autostart"
+                                except Exception as e:
+                                    print(f"[autostart read error] {e}")
 
                 startup_files = [".bashrc", ".profile", ".xinitrc"]
                 for sf in startup_files:
-                    sf_path = os.path.join(self.user_home, sf)
-                    if os.path.isfile(sf_path):
-                        try:
-                            with open(sf_path, 'r', errors="ignore") as f:
-                                content = f.read()
-                                if (exe_path and exe_path in content) or (full_path and full_path in content):
-                                    return True, f"{full_path or exe_path} is present in {sf}"
-                        except Exception as e:
-                            print(f"[shell file read error] {e}")
+                    for home in user_home:
+                        sf_path = os.path.join(home, sf)
+                        if os.path.isfile(sf_path):
+                            try:
+                                with open(sf_path, 'r', errors="ignore") as f:
+                                    content = f.read()
+                                    if (exe_path and exe_path in content) or (full_path and full_path in content):
+                                        return True, f"{full_path or exe_path} is present in {sf}"
+                            except Exception as e:
+                                print(f"[shell file read error] {e}")
 
                 try:
                     crontab_output = check_output(["crontab", "-l"], text=True, stderr=open(os.devnull, 'w'))
@@ -627,6 +643,19 @@ class PersistenceChecker:
     def check_cron_jobs(self):
         score = 0
         sus_files = ["base64", "eval", "curl", "wget", ".py", "python", "node", "perl"]
+        suspicious_paths = ["/tmp/", "/dev/shm/", ".config/", "/.hidden/", "/.local/", "/var/tmp/"]
+
+        obfuscation_patterns = [
+            r'(eval|exec|base64|echo|printf)\s+[\'\"]?[A-Za-z0-9+/=]{20,}[\'\"]?',
+            r'python\s+-c\s+["\']import\s+base64',
+            r'perl\s+-e\s+["\']eval',
+            r'bash\s+-c\s+["\'].*base64.*["\']',
+            r'\.\/\.\w+',
+            r'(curl|wget).*(/tmp|/dev/shm)',
+            r'>\s*\.\w+',
+        ]
+        job_pattern = re.compile(r'^\s*\*\s+\*\s+\*\s+\*\s+\*')
+
         cron_dirs = glob.glob("/etc/cron*") + ["/var/spool/cron/", os.path.expanduser("~/.crontab")]
         cron_files = []
 
@@ -643,34 +672,63 @@ class PersistenceChecker:
             try:
                 with open(file, "r") as f:
                     contents = f.read()
-                    for word in suspicious_paths:
+                    for word in suspicious_paths + sus_files:
                         if word in contents:
                             score += 1
-                    for word in sus_files:
-                        if word in contents:
+                    for pattern in obfuscation_patterns:
+                        if re.search(pattern, contents):
                             score += 1
+                    if job_pattern.search(contents):
+                        score += 1
             except Exception as e:
-                print(f"{e}")
+                print(f"[cron error] {e}")
+
+        try:
+            users = [u.pw_name for u in pwd.getpwall() if u.pw_uid >= 1000 and "/nologin" not in u.pw_shell]
+            for user in users:
+                try:
+                    cron = check_output(["crontab", "-u", user, "-l"], text=True, stderr=open(os.devnull, "w"))
+                    for word in suspicious_paths + sus_files:
+                        if word in cron:
+                            score += 1
+                    for pattern in obfuscation_patterns:
+                        if re.search(pattern, cron):
+                            score += 1
+                    if job_pattern.search(cron):
+                        score += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[user cron check error] {e}")
+
         return score
 
+
     def list_user_rc_files(self):
-        home = self.user_home
-        rc_patterns = [".*rc", ".bash_profile", ".profile", ".xinitrc"]
-        system_files = [
-            "/etc/bash.bashrc", "/etc/zsh/zshrc", "/etc/profile", "/etc/ld.so.preload"
-        ]
-        profile_dir = "/etc/profile.d"
-        files = []
-        for pattern in rc_patterns:
-            files.extend(glob.glob(os.path.join(home, pattern)))
+        user_home = self.get_existing_user_homes()
+        all_rc_files = []
 
-        for s_file in system_files:
-            files.append(s_file)
+        for home in user_home:
+            rc_patterns = [".*rc", ".bash_profile", ".profile", ".xinitrc"]
+            system_files = [
+                "/etc/bash.bashrc", "/etc/zsh/zshrc", "/etc/profile", "/etc/ld.so.preload"
+            ]
+            profile_dir = "/etc/profile.d"
+            files = []
 
-        if os.path.isdir(profile_dir):
-            files.extend(os.path.join(profile_dir, p_file) for p_file in os.listdir(profile_dir))
+            for pattern in rc_patterns:
+                files.extend(glob.glob(os.path.join(home, pattern)))
 
-        return [f for f in files if os.path.isfile(f)]
+            for s_file in system_files:
+                files.append(s_file)
+
+            if os.path.isdir(profile_dir):
+                files.extend(
+                    os.path.join(profile_dir, p_file) for p_file in os.listdir(profile_dir)
+                )
+
+            all_rc_files.extend([f for f in files if os.path.isfile(f)])
+        return all_rc_files
 
     def check_ld_preload(self, pid, files_to_check):
         score = 0
@@ -1305,10 +1363,11 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
         
         if bi.is_upx_packed(full_path) or bi.is_deleted_on_disk(pid):
             sus_score += 1
+            reasons.append("binary is upx packed")
         
-        cron_job_score = pc.check_cron_jobs()
-        if cron_job_score > 1:
-            sus_score += 2
+        # cron_job_score = pc.check_cron_jobs()
+        # if cron_job_score >= 2:
+        #     sus_score += 2
             
         parent_process = pv.get_parent_process(pid)
         if pv.is_legitimate_parent(parent_process):
@@ -1920,8 +1979,130 @@ def prompt_user_trust_a_process():
         else:
             print(f"[FAILED] Could not update trust status for: {binary_name}")
 
-def harden_system():
-    pass
+def harden_system(is_log=False):
+    found = False
+    pc = PersistenceChecker()
+    log("Hardening the system", True)
+
+    history_patterns = [
+        re.compile(r'alias\s+precmd\s+.*history\s+-S'),
+        re.compile(r'.*history\s+>>?\s*/tmp/.*'),
+        re.compile(r'.*history\s+>>?\s*\.\w+'),
+        re.compile(r'function\s+fish_prompt\s*.*history\s+-h'),
+        re.compile(r'.*tee\s+.*history\s+.*'),
+        re.compile(r'function\s+precmd\s*\(\)\s*{.*history\s+-a'),
+        re.compile(r'.*\|\s*history\s+>>?.*'),
+        re.compile(r'PS1\s*=\s*["\']?.*history\s+-a'),
+        re.compile(r'.*history\s+-w\s+.*'),
+        re.compile(r'.*HISTFILE\s*=\s*/tmp/.*'),
+        re.compile(r'.*HISTFILE\s*=\s*\.\w+'),
+        re.compile(r'PROMPT_COMMAND\s*=\s*["\']?.*history\s+-a'),
+        re.compile(r'precmd\s*\(\)\s*{.*history\s+.*}'),
+        re.compile(r'PROMPT_COMMAND\s*=\s*["\']?[^"\']*;?\s*history\s+-a[^"\']*["\']?'),
+    ]
+    rc_files = pc.list_user_rc_files()
+    if rc_files:
+        log("Checking for any suspicious strings in rc files", True)
+        for file in rc_files:
+            timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+            if is_log:
+                sys.stdout.write(f"\033[1G{timestamp} Checking RC File - {file}\n")
+                sys.stdout.flush()
+                time.sleep(0.002)
+
+            try:
+                with open(file, "r") as f:
+                    for line_no, line in enumerate(f, 1):
+                        for pattern in history_patterns:
+                            if pattern.search(line):
+                                print(f"\n[!] Shell history abuse detected in {file} @ line {line_no}")
+                                print(f"    {line.strip()}\n")
+                                found = True
+            except Exception as e:
+                print(f"{timestamp} [ERROR] Could not read {file}: {e}")
+
+    pam_files = [
+        "/etc/pam.d/system-auth", "/etc/pam.d/password-auth",
+        "/etc/pam.d/login", "/etc/pam.d/sshd", "/etc/pam.d/passwd"
+    ]
+    pam_patterns = [
+        re.compile(r'^\s*session\s+.*pam_tty_audit\.so\s+.*enable='),
+        re.compile(r'^\s*session\s+.*pam_tty_audit\.so\s+.*enable=.*log_password'),
+        re.compile(r'^\s*auth\s+required\s+/lib.*pam_unix\.so\s+.*debug'),
+        re.compile(r'^\s*auth\s+.*pam_exec\.so\s+.*'),
+        re.compile(r'^\s*auth\s+.*pam_exec\.so\s+.*(?:/tmp/|/dev/shm/).*'),
+        re.compile(r'^\s*auth\s+.*pam_exec\.so\s+.*command='),
+        re.compile(r'^\s*auth\s+.*pam_python\.so\s+.*'),
+        re.compile(r'^\s*auth\s+.*pam_exec\.so\s+.*sh\\b'),
+        re.compile(r'^\s*auth\s+required\s+pam_permit\.so'),
+        re.compile(r'^\s*(account|session)\s+required\s+pam_deny\.so'),
+        re.compile(r'^\s*(auth|session|account)\s+.*\\.so\\s+/tmp/.*'),
+        re.compile(r'^\s*auth\\s+.*pam_exec\\.so\\s+.*/\\.[^/]+/.*'),
+        re.compile(r'^\s*auth\\s+.*pam_exec\\.so\\s+.*>>?\\s*\\.\\w+'),
+    ]
+    if is_log:
+        print()
+    log("Checking for any PAM abuses", True)
+    for pam_file in pam_files:
+        if os.path.isfile(pam_file):
+            timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+            if is_log:
+                sys.stdout.write(f"\033[1G{timestamp} Checking PAM File - {pam_file}\n")
+                sys.stdout.flush()
+                time.sleep(0.002)
+
+            try:
+                with open(pam_file, "r") as f:
+                    for line_no, line in enumerate(f, 1):
+                        for pattern in pam_patterns:
+                            if pattern.search(line):
+                                print(f"[!] PAM keystroke logging abuse in {pam_file} @ line {line_no}")
+                                print(f"    {line.strip()}")
+                                found = True
+            except Exception as e:
+                print(f"{timestamp} [ERROR] Could not read {pam_file}: {e}")
+
+    log("Checking for suspicious command aliases", True)
+    alias_pattern = re.compile(r'alias\\s+(sudo|ssh|su|nano|vim)\\s*=')
+    for file in rc_files:
+        try:
+            with open(file, "r") as f:
+                for line_no, line in enumerate(f, 1):
+                    if alias_pattern.search(line):
+                        print(f"[!] Suspicious alias in {file} @ line {line_no}")
+                        print(f"    {line.strip()}")
+                        found = True
+        except Exception as e:
+            print(f"[ERROR] Could not read {file}: {e}")
+
+    log("Checking ~/.inputrc for potential abuse", True)
+    for home in pc.get_existing_user_homes():
+        inputrc_path = os.path.join(home, ".inputrc")
+        if os.path.isfile(inputrc_path):
+            try:
+                with open(inputrc_path, "r") as f:
+                    for line_no, line in enumerate(f, 1):
+                        if "shell:" in line or "readline" in line:
+                            print(f"[!] Suspicious line in {inputrc_path} @ line {line_no}")
+                            print(f"    {line.strip()}")
+                            found = True
+            except Exception as e:
+                print(f"[ERROR] Could not read {inputrc_path}: {e}")
+    
+    log("Checking Cron jobs for potential keyloggers", True)
+    cron_job_score = pc.check_cron_jobs()
+    if cron_job_score >= 2:
+        if cron_job_score == 1:
+            print("[~] Mildly suspicious cron entry found. Review manually.")
+        elif cron_job_score >= 2 and cron_job_score < 5:
+            print(f"[!] Suspicious cron behavior detected (score: {cron_job_score}). Investigate.")
+            found = True
+        else:
+            print(f"[!!!] Highly suspicious cron activity! (score: {cron_job_score}) Possible malware persistence.")
+            found = True
+
+    if not found:
+        log("Not Found any malicious behaviour, moving on", True)
 
 
 def log(msg, is_log_enabled):
@@ -1976,3 +2157,8 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
 
+    if args.harden:
+        try:
+            harden_system(args.log)
+        except KeyboardInterrupt:
+            print("\n[*] Scan interrupted by user. Exiting...")
