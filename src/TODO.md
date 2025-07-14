@@ -4,10 +4,13 @@
 
 - add reasons to functions that are applicable
 - Add user Prompt to make a process `trusted`
+
 - uinput detection - virtual keyboard
 - LD_PRELOAD detection
 - Wayland Checks
-- Add -p pid option for checking a particular pid
+
+- Add -p pid option for checking a particular pid - done
+
 - Add Checks -> like precautions:
   checking bashrc, zshrc files
   check if some process is running `history -a` or something like that, i.e logging history to a file
@@ -19,6 +22,8 @@ IMPORTANT:
 - Add log option to reasons for more verbose reasoning
 - Add log, explaining why a process is trusted
 - Add a initial setup flow, that get all the details about input devices etc..
+- Maintain a common logging and printing theme
+
 
 - Maybe in way future, implement sandboxing?
 
