@@ -47,13 +47,16 @@ int handle_vfs_read(struct pt_regs *ctx) {
   if (bpf_map_lookup_elem(&seen_pids, &pid))
     return 0;
 
-  // __AUTOGENERATE_DEVICE_FILTER__
-  if ((major == 13 && minor >= 32 && minor <= 35) ||
-      (major == 13 && minor >= 63 && minor <= 90) ||
-      (major == 5 && minor == 0) || (major == 5 && minor == 2) ||
-      (major == 136 && minor >= 0 && minor <= 4) ||
-      (major == 136 && minor == 6) ||
-      (major == 240 && minor >= 0 && minor <= 3)) {
+  // __AUTOGEN_DEVICE_FILTER__
+  if (
+    (major == 13 && minor >= 32 && minor <= 35) || \
+    (major == 13 && minor >= 63 && minor <= 90) || \
+    (major == 5 && minor == 0) || \
+    (major == 5 && minor == 2) || \
+    (major == 136 && minor >= 0 && minor <= 4) || \
+    (major == 136 && minor == 6) || \
+    (major == 244 && minor >= 0 && minor <= 3)
+  ) {
     bpf_map_update_elem(&seen_pids, &pid, &dummy, BPF_ANY);
     struct event_t ev = {
         .pid = pid,
@@ -62,5 +65,6 @@ int handle_vfs_read(struct pt_regs *ctx) {
     };
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &ev, sizeof(ev));
   }
+  return 0;
   return 0;
 }

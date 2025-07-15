@@ -76,12 +76,12 @@ def generate_condition(grouped):
     return " || \\\n    ".join(conds)
 
 
-def inject_into_bpf(bpf_file="test.bpf.c"):
+def inject_into_bpf(bpf_file="vfsread.bpf.c"):
     grouped = generate_mm()
     condition_block = generate_condition(grouped)
 
     new_code = f"""\
-  // __AUTOGENERATE_DEVICE_FILTER__
+  // __AUTOGEN_DEVICE_FILTER__
   if (
     {condition_block}
   ) {{
@@ -101,7 +101,7 @@ def inject_into_bpf(bpf_file="test.bpf.c"):
     new_lines = []
     in_autogen = False
     for line in lines:
-        if '// __AUTOGENERATE_DEVICE_FILTER__' in line:
+        if '// __AUTOGEN_DEVICE_FILTER__' in line:
             new_lines.append(new_code)
             in_autogen = True
             continue
@@ -117,8 +117,4 @@ def inject_into_bpf(bpf_file="test.bpf.c"):
     print(f"[INFO] Injected dynamic device filter data into {bpf_file}.")
 
 if __name__ == '__main__':
-    # inject_into_bpf()
-    # print(iter_paths())
-    out = generate_mm()
-    for major, minor in out.items():
-        print(group_minor_values(minor))
+    inject_into_bpf()
