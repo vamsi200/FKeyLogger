@@ -1,4 +1,4 @@
-#include "test.skel.h"
+#include "vfsread.skel.h"
 #include <bpf/libbpf.h>
 #include <signal.h>
 #include <stdint.h>
@@ -28,22 +28,22 @@ static void handle_event(void *ctx, int cpu, void *data, unsigned int data_sz) {
 static void handle_signal(int sig) { running = 0; }
 
 int main() {
-  struct test_bpf *skel = test_bpf__open_and_load();
+  struct vfsread_bpf *skel = vfsread_bpf__open_and_load();
   if (!skel) {
     fprintf(stderr, "Failed to open and load BPF program\n");
     return 1;
   }
 
-  if (test_bpf__attach(skel)) {
+  if (vfsread_bpf__attach(skel)) {
     fprintf(stderr, "Failed to attach BPF program\n");
-    test_bpf__destroy(skel);
+    vfsread_bpf__destroy(skel);
     return 1;
   }
 
   fptr = fopen("bpf_output.json", "a");
   if (!fptr) {
     perror("fopen");
-    test_bpf__destroy(skel);
+    vfsread_bpf__destroy(skel);
     return 1;
   }
 
@@ -57,7 +57,7 @@ int main() {
   if (!pb) {
     fprintf(stderr, "Failed to create perf buffer\n");
     fclose(fptr);
-    test_bpf__destroy(skel);
+    vfsread_bpf__destroy(skel);
     return 1;
   }
 
@@ -75,7 +75,7 @@ int main() {
   }
 
   perf_buffer__free(pb);
-  test_bpf__destroy(skel);
+  vfsread_bpf__destroy(skel);
 
   if (fptr) {
     fclose(fptr);
