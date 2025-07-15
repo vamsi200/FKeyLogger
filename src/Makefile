@@ -9,7 +9,7 @@ test.bpf.o: test.bpf.c
 	$(BPF_CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 test.skel.h: test.bpf.o
-	bpftool gen skeleton $< > $@
+	./bin/bpftool gen skeleton $< > $@
 
 loader: main.c test.skel.h
 	clang $(USER_CFLAGS) -I. -o loader main.c $(LIBS)
