@@ -1,4 +1,5 @@
 import json
+from math import pi
 import psutil
 import os
 import ipaddress
@@ -684,10 +685,13 @@ class PersistenceChecker:
                 print(f"[cron error] {e}")
 
         try:
-            users = [u.pw_name for u in pwd.getpwall() if u.pw_uid >= 1000 and "/nologin" not in u.pw_shell]
+            users = [u.pw_name for u in pwd.getpwall() if "/nologin" not in u.pw_shell]
             for user in users:
                 try:
                     cron = check_output(["crontab", "-u", user, "-l"], text=True, stderr=open(os.devnull, "w"))
+                    print("      ├─ Current cronjobs:")
+                    for line in cron.splitlines():
+                        print(f"      ├─ {line}")
                     for word in suspicious_paths + sus_files:
                         if word in cron:
                             score += 1
@@ -730,26 +734,38 @@ class PersistenceChecker:
             all_rc_files.extend([f for f in files if os.path.isfile(f)])
         return all_rc_files
 
-    def check_ld_preload(self, pid, files_to_check):
+    def check_ld_preload(self, pid=None, files_to_check=None):
         score = 0
-        try:
-            p = psutil.Process(pid)
-            env = p.environ()
-            if "LD_PRELOAD" in env:
-                score += 1
-        except Exception as e:
-            print(f"{e}")
+        found_pids = set()
+        if pid:
+            try:
+                p = psutil.Process(pid)
+                env = p.environ()
+                if "LD_PRELOAD" in env:
+                    score += 1
+            except Exception as e:
+                print(f"{e}")
+        else:
+            try:
+                for p in psutil.process_iter(['pid', 'environ']):
+                    env = p.environ()
+                    if "LD_PRELOAD" in env:
+                        score = 1
+                        found_pids.add(p.pid)
 
-        for fname in files_to_check:
-            if os.path.exists(fname):
-                try:
-                    with open(fname, "r") as f:
-                        contents = f.read()
-                        if "LD_PRELOAD" in contents or "ld_preload" in contents:
-                            score += 1
-                except Exception as e:
-                    print(f"{e}")
+            except Exception as e:
+                print(f"{e}")
 
+        if files_to_check:
+            for fname in files_to_check:
+                if os.path.exists(fname):
+                    try:
+                        with open(fname, "r") as f:
+                            contents = f.read()
+                            if "LD_PRELOAD" in contents or "ld_preload" in contents:
+                                score += 1
+                    except Exception as e:
+                        print(f"{e}")
         try:
             if os.path.exists("/etc/ld.so.preload"):
                 with open("/etc/ld.so.preload", "r") as f:
@@ -759,7 +775,7 @@ class PersistenceChecker:
         except Exception as e:
             print(f"{e}")
 
-        return score
+        return score, found_pids
 
 class NetworkMonitor:
     #TODO:
@@ -1979,11 +1995,14 @@ def prompt_user_trust_a_process():
         else:
             print(f"[FAILED] Could not update trust status for: {binary_name}")
 
-def harden_system(is_log=False):
+def intial_system_checks(is_log=False):
     found = False
     pc = PersistenceChecker()
-    log("Hardening the system", True)
+    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    print(f"{timestamp} Basic system check started.\n"
+        f"        ├─ Please use advanced options for more detailed analysis (see --help).\n")
 
+    
     history_patterns = [
         re.compile(r'alias\s+precmd\s+.*history\s+-S'),
         re.compile(r'.*history\s+>>?\s*/tmp/.*'),
@@ -2000,11 +2019,11 @@ def harden_system(is_log=False):
         re.compile(r'precmd\s*\(\)\s*{.*history\s+.*}'),
         re.compile(r'PROMPT_COMMAND\s*=\s*["\']?[^"\']*;?\s*history\s+-a[^"\']*["\']?'),
     ]
+    
     rc_files = pc.list_user_rc_files()
     if rc_files:
         log("Checking for any suspicious strings in rc files", True)
         for file in rc_files:
-            timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
             if is_log:
                 sys.stdout.write(f"\033[1G{timestamp} Checking RC File - {file}\n")
                 sys.stdout.flush()
@@ -2074,7 +2093,7 @@ def harden_system(is_log=False):
                         found = True
         except Exception as e:
             print(f"[ERROR] Could not read {file}: {e}")
-
+    
     log("Checking ~/.inputrc for potential abuse", True)
     for home in pc.get_existing_user_homes():
         inputrc_path = os.path.join(home, ".inputrc")
@@ -2090,20 +2109,36 @@ def harden_system(is_log=False):
                 print(f"[ERROR] Could not read {inputrc_path}: {e}")
     
     log("Checking Cron jobs for potential keyloggers", True)
+
+    #TODO: Improve below, instead of just saying to review manually
     cron_job_score = pc.check_cron_jobs()
-    if cron_job_score >= 2:
-        if cron_job_score == 1:
-            print("[~] Mildly suspicious cron entry found. Review manually.")
-        elif cron_job_score >= 2 and cron_job_score < 5:
-            print(f"[!] Suspicious cron behavior detected (score: {cron_job_score}). Investigate.")
-            found = True
-        else:
-            print(f"[!!!] Highly suspicious cron activity! (score: {cron_job_score}) Possible malware persistence.")
-            found = True
+
+    if cron_job_score == 1:
+        print("[~] Mildly suspicious cron entry found. Please Review manually.")
+    elif cron_job_score >= 2 and cron_job_score < 5:
+        print(f"[!] Suspicious cron behavior detected. Please Review manually")
+        found = True
+    elif cron_job_score > 5:
+        print(f"[!!!] Highly suspicious cron activity! Possible malware persistence.")
+        found = True
+
+
+    print()
+    log("Checking for LD_PRELOAD usage", True)
+    ld_preload_score, pid = pc.check_ld_preload()
+    print("      ├─ PID's using LD_PRELOAD: ")
+
+    for p in pid:
+        print(f"      ├─ {p}")
+
+    if ld_preload_score >= 1:
+        print("[~] Mildly suspicious usage of LD_PRELOAD")
+    elif ld_preload_score >=2 :
+        print(f"[!] Suspicious LD_PRELOAD behavior detected.")
+        found = True
 
     if not found:
         log("Not Found any malicious behaviour, moving on", True)
-
 
 def log(msg, is_log_enabled):
     if is_log_enabled:
@@ -2125,9 +2160,9 @@ def parse_args():
          "Use this flag to disable that behavior and scan all processes, including the trusted ones."
 )
     parser.add_argument(
-    "--harden",
+    "--initial_checks",
     action="store_true",
-    help="Performs system hardening checks, like inspection of shell rc files, running process validation, detection of suspicious use of 'history -a', and potential PAM misuse."
+    help="Performs system level checks, like inspection of shell rc files, detection of suspicious use of 'history -a', and potential PAM misuse."
 )
     return parser.parse_args()
 
@@ -2135,6 +2170,8 @@ if __name__ == "__main__":
     require_root()
     args = parse_args()
     m = BinaryAnalyzer()
+    intial_system_checks(args.log)
+
     if args.scan:
         try:
             scan_process(args.log)
@@ -2157,8 +2194,9 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
 
-    if args.harden:
+    if args.initial_checks:
         try:
-            harden_system(args.log)
+            intial_system_checks(args.log)
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
+
