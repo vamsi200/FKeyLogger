@@ -1,5 +1,4 @@
 import json
-from math import pi
 import psutil
 import os
 import ipaddress
@@ -20,6 +19,7 @@ import pyudev
 import signal
 from datetime import datetime
 import re
+import collections
 
 file_path = "process.json"
 white_list_ports = [8080, 443, 22]
@@ -641,11 +641,12 @@ class PersistenceChecker:
             print(f"{e}")
             return False, None
 
-    def check_cron_jobs(self):
+    def check_cron_jobs(self, is_log=False):
         score = 0
-        sus_files = ["base64", "eval", "curl", "wget", ".py", "python", "node", "perl"]
-        suspicious_paths = ["/tmp/", "/dev/shm/", ".config/", "/.hidden/", "/.local/", "/var/tmp/"]
+        suspicious_entries = []
 
+        sus_files = ["base64", "eval", "curl", "wget", ".py", "python", "node", "perl", ".sh"]
+        suspicious_paths = ["/tmp/", "/dev/shm/", ".config/", "/.hidden/", ".local/", "/var/tmp/"]
         obfuscation_patterns = [
             r'(eval|exec|base64|echo|printf)\s+[\'\"]?[A-Za-z0-9+/=]{20,}[\'\"]?',
             r'python\s+-c\s+["\']import\s+base64',
@@ -659,7 +660,6 @@ class PersistenceChecker:
 
         cron_dirs = glob.glob("/etc/cron*") + ["/var/spool/cron/", os.path.expanduser("~/.crontab")]
         cron_files = []
-
         for path in cron_dirs:
             if os.path.isfile(path):
                 cron_files.append(path)
@@ -669,44 +669,55 @@ class PersistenceChecker:
                     if os.path.isfile(full_path):
                         cron_files.append(full_path)
 
+        def _scan_line_for_scripts(line):
+            tokens = line.strip().split()
+            found_script_paths = []
+            for token in tokens:
+                if token.startswith('/') or token.startswith('./') or token.endswith(('.sh','.py','.pl','.rb')):
+                    if not re.fullmatch(r'\d+|\*|\*/\d+', token):
+                        found_script_paths.append(token)
+            return found_script_paths
+
+
+
         for file in cron_files:
+            log(f"\033[1mChecking Cron file:\033[0m {file}", is_log)
             try:
                 with open(file, "r") as f:
-                    contents = f.read()
-                    for word in suspicious_paths + sus_files:
-                        if word in contents:
+                    for line in f:
+                        suspicious_signals = []
+                        for word in suspicious_paths + sus_files:
+                            if word in line:
+                                suspicious_signals.append(word)
+                        for pattern in obfuscation_patterns:
+                            if re.search(pattern, line):
+                                suspicious_signals.append(f"pattern:{pattern}")
+                        if job_pattern.search(line):
+                            suspicious_signals.append("runs every minute")
+                        script_paths = list(set(_scan_line_for_scripts(line)))
+                        script_sus = []
+                        for script_path in script_paths:
+                            abs_path = script_path
+                            if script_path.startswith('./'):
+                                abs_path = os.path.abspath(os.path.join(os.path.dirname(file), script_path))
+                            if os.path.exists(abs_path) and os.path.isfile(abs_path):
+                                libs, weight = has_suspicious_modules(abs_path, load_sus_libraries())
+                                if libs and weight > 2:
+                                    suspicious_signals.append(f"script:{abs_path}")
+                                    script_sus.append((abs_path, libs))
+                        if suspicious_signals and script_sus:
+                            entry = {
+                                "file": file,
+                                "line": line.strip(),
+                                "signals": suspicious_signals,
+                                "script_hits": script_sus,
+                            }
+                            suspicious_entries.append(entry)
                             score += 1
-                    for pattern in obfuscation_patterns:
-                        if re.search(pattern, contents):
-                            score += 1
-                    if job_pattern.search(contents):
-                        score += 1
             except Exception as e:
                 print(f"[cron error] {e}")
 
-        try:
-            users = [u.pw_name for u in pwd.getpwall() if "/nologin" not in u.pw_shell]
-            for user in users:
-                try:
-                    cron = check_output(["crontab", "-u", user, "-l"], text=True, stderr=open(os.devnull, "w"))
-                    print("      ├─ Current cronjobs:")
-                    for line in cron.splitlines():
-                        print(f"      ├─ {line}")
-                    for word in suspicious_paths + sus_files:
-                        if word in cron:
-                            score += 1
-                    for pattern in obfuscation_patterns:
-                        if re.search(pattern, cron):
-                            score += 1
-                    if job_pattern.search(cron):
-                        score += 1
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"[user cron check error] {e}")
-
-        return score
-
+        return score, suspicious_entries
 
     def list_user_rc_files(self):
         user_home = self.get_existing_user_homes()
@@ -1003,8 +1014,8 @@ def has_suspicious_strings(binary_path):
         b"KeyPress",
         b"keyboard.h",
         b"log_keys",
+        b"proc",
         b"SendInput",
-        b"/proc/",
         b"RecordKey",
         b"input_log",
         b"KeyLogger",
@@ -1689,7 +1700,7 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
 
                 reason_list = sorted(reasons_by_pid.get(pid, []))
                 if reason_list:
-                    print(" ├─ Reasons:")
+                    print(" ├─ Flagged due to:")
                     for idx, reason in enumerate(reason_list):
                         symbol = "└─" if idx == len(reason_list) - 1 else "├─"
                         print(f" │   {symbol} {reason}")
@@ -1999,10 +2010,27 @@ def intial_system_checks(is_log=False):
     found = False
     pc = PersistenceChecker()
     timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
-    print(f"{timestamp} Basic system check started.\n"
-        f"        ├─ Please use advanced options for more detailed analysis (see --help).\n")
+    print("="*50)
+    print("Default option will perform the following checks:\n")
+    print("  - Inspect user shell configuration (rc files) for suspicious patterns")
+    print("  - Analyze PAM authentication modules for credential logging risks")
+    print("  - Scan for suspicious shell command aliases")
+    print("  - Check user .inputrc files for malicious behaviour")
+    print("  - Review user cron jobs and scheduled tasks for persistence risks")
+    print("  - Use of LD_PRELOAD for process injection\n")
+    print("\033[1mPlease use advanced options for more detailed analysis (see --help)\033[0m\n")
+    print("="*50)
+    answer = input("\033[1mEnter y\033[0m to continue, or any other key to exit: ").strip().lower()
 
+    if answer != "y":
+        print("\nAborted by user.")
+        sys.exit(0)
     
+    print()
+    print("\033[1m==================================================")
+    print(f"{timestamp} Basic system checks started.".center(50))
+    print("\033[1m==================================================")
+
     history_patterns = [
         re.compile(r'alias\s+precmd\s+.*history\s+-S'),
         re.compile(r'.*history\s+>>?\s*/tmp/.*'),
@@ -2022,7 +2050,7 @@ def intial_system_checks(is_log=False):
     
     rc_files = pc.list_user_rc_files()
     if rc_files:
-        log("Checking for any suspicious strings in rc files", True)
+        log("Checking for any suspicious strings in rc files", is_log)
         for file in rc_files:
             if is_log:
                 sys.stdout.write(f"\033[1G{timestamp} Checking RC File - {file}\n")
@@ -2039,6 +2067,8 @@ def intial_system_checks(is_log=False):
                                 found = True
             except Exception as e:
                 print(f"{timestamp} [ERROR] Could not read {file}: {e}")
+    if not found:
+        print("\033[1;32mRC Files\033[0m ..................... \033[1;32mOK\033[0m")
 
     pam_files = [
         "/etc/pam.d/system-auth", "/etc/pam.d/password-auth",
@@ -2061,7 +2091,7 @@ def intial_system_checks(is_log=False):
     ]
     if is_log:
         print()
-    log("Checking for any PAM abuses", True)
+    log("Checking for any PAM abuses", is_log)
     for pam_file in pam_files:
         if os.path.isfile(pam_file):
             timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
@@ -2080,8 +2110,11 @@ def intial_system_checks(is_log=False):
                                 found = True
             except Exception as e:
                 print(f"{timestamp} [ERROR] Could not read {pam_file}: {e}")
+            
+    if not found:
+        print("\033[1;32mPAM Authentication\033[0m ........... \033[1;32mOK\033[0m")
 
-    log("Checking for suspicious command aliases", True)
+    log("Checking for suspicious command aliases", is_log)
     alias_pattern = re.compile(r'alias\\s+(sudo|ssh|su|nano|vim)\\s*=')
     for file in rc_files:
         try:
@@ -2094,7 +2127,10 @@ def intial_system_checks(is_log=False):
         except Exception as e:
             print(f"[ERROR] Could not read {file}: {e}")
     
-    log("Checking ~/.inputrc for potential abuse", True)
+    if not found:
+        print("\033[1;32mShell Aliases\033[0m ................ \033[1;32mOK\033[0m")
+    
+    log("Checking ~/.inputrc for potential abuse", is_log)
     for home in pc.get_existing_user_homes():
         inputrc_path = os.path.join(home, ".inputrc")
         if os.path.isfile(inputrc_path):
@@ -2107,38 +2143,54 @@ def intial_system_checks(is_log=False):
                             found = True
             except Exception as e:
                 print(f"[ERROR] Could not read {inputrc_path}: {e}")
-    
-    log("Checking Cron jobs for potential keyloggers", True)
-
-    #TODO: Improve below, instead of just saying to review manually
-    cron_job_score = pc.check_cron_jobs()
-
-    if cron_job_score == 1:
-        print("[~] Mildly suspicious cron entry found. Please Review manually.")
-    elif cron_job_score >= 2 and cron_job_score < 5:
-        print(f"[!] Suspicious cron behavior detected. Please Review manually")
-        found = True
-    elif cron_job_score > 5:
-        print(f"[!!!] Highly suspicious cron activity! Possible malware persistence.")
-        found = True
-
-
-    print()
-    log("Checking for LD_PRELOAD usage", True)
-    ld_preload_score, pid = pc.check_ld_preload()
-    print("      ├─ PID's using LD_PRELOAD: ")
-
-    for p in pid:
-        print(f"      ├─ {p}")
-
-    if ld_preload_score >= 1:
-        print("[~] Mildly suspicious usage of LD_PRELOAD")
-    elif ld_preload_score >=2 :
-        print(f"[!] Suspicious LD_PRELOAD behavior detected.")
-        found = True
 
     if not found:
-        log("Not Found any malicious behaviour, moving on", True)
+        print("\033[1;32minputrc Inspection\033[0m ........... \033[1;32mOK\033[0m")
+
+    log("Checking Cron jobs for potential keyloggers", is_log)
+
+    #TODO: Improve below, instead of just saying to review manually
+    _, susp_entries = pc.check_cron_jobs(is_log)
+    
+    if susp_entries:
+        print("\033[1;33mCron Job Analysis\033[0m ............ \033[1;31mWARNING\033[0m\n")
+        print("    Suspicious cron jobs detected:")
+        for entry in susp_entries:
+            source = entry.get("file") or f"user: {entry.get('user', 'unknown')}"
+            print(f"        - {source}")
+            print(f"            Schedule/Command: {entry['line']}")
+            if entry['signals']:
+                print(f"            Flags: {', '.join(entry['signals'])}")
+            for spath, sus_string in entry["script_hits"]:
+                print(f"            >>> Suspicious string found in: {spath}")
+                print(f"                Pattern: {sus_string!r}")
+            print()
+    else:
+        print("\033[1;32mCron Job Analysis\033[0m ............ \033[1;32mOK\033[0m")
+
+    score, found_pids = pc.check_ld_preload()
+    if score == 0:
+        print("\033[1;32mLD_PRELOAD Usage\033[0m ............. \033[1;32mOK\033[0m")
+        print("    No unusual or unauthorized usage detected.\n")
+    elif score == 1:
+        print("\033[1;33mLD_PRELOAD Usage\033[0m ............. \033[1;33mPossible Issue\033[0m")
+        bin_pid_map = collections.defaultdict(list)
+        for pid in found_pids:
+            try:
+                p = psutil.Process(pid)
+                binary_path = get_path(p.cwd(), p.cmdline(), p.exe())
+                bin_pid_map[binary_path].append(pid)
+            except Exception:
+                continue
+        print("    Possible unusual LD_PRELOAD use detected. Review the following binaries in use:")
+        for binary_path, pids in bin_pid_map.items():
+            print(f"        Binary Path: {binary_path} (PID count: {len(pids)})")
+            if len(pids) <= 3:
+                print(f"            PIDs: {', '.join(str(pid) for pid in pids)}")
+            else:
+                shown = ', '.join(str(pid) for pid in pids[:3])
+                print(f"            PIDs: {shown} ... (and {len(pids)-3} more)")
+        print("    If unsure, please use -p option for full details.\n")
 
 def log(msg, is_log_enabled):
     if is_log_enabled:
@@ -2159,44 +2211,34 @@ def parse_args():
     help="By default, trusted processes (based on heuristics or user input) are skipped. "
          "Use this flag to disable that behavior and scan all processes, including the trusted ones."
 )
-    parser.add_argument(
-    "--initial_checks",
-    action="store_true",
-    help="Performs system level checks, like inspection of shell rc files, detection of suspicious use of 'history -a', and potential PAM misuse."
-)
     return parser.parse_args()
 
 if __name__ == "__main__":
     require_root()
     args = parse_args()
     m = BinaryAnalyzer()
-    intial_system_checks(args.log)
 
     if args.scan:
         try:
             scan_process(args.log)
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
-    if args.monitor:
+    elif args.monitor:
         try:
             phase_one_analysis(10, args.log, args.all)
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
-    if args.p:
+    elif args.p:
         try:
             scan_process(args.log, args.p)
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
 
-    if args.modify_trust:
+    elif args.modify_trust:
         try:
             prompt_user_trust_a_process()
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
-
-    if args.initial_checks:
-        try:
+    else:
             intial_system_checks(args.log)
-        except KeyboardInterrupt:
-            print("\n[*] Scan interrupted by user. Exiting...")
 
