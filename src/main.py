@@ -2007,31 +2007,57 @@ def prompt_user_trust_a_process():
             print(f"[FAILED] Could not update trust status for: {binary_name}")
 
 def intial_system_checks(is_log=False):
-    found = False
     pc = PersistenceChecker()
     timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
-    print("="*50)
-    print("Default option will perform the following checks:\n")
-    print("  - Inspect user shell configuration (rc files) for suspicious patterns")
-    print("  - Analyze PAM authentication modules for credential logging risks")
-    print("  - Scan for suspicious shell command aliases")
-    print("  - Check user .inputrc files for malicious behaviour")
-    print("  - Review user cron jobs and scheduled tasks for persistence risks")
-    print("  - Use of LD_PRELOAD for process injection\n")
-    print("\033[1mPlease use advanced options for more detailed analysis (see --help)\033[0m\n")
-    print("="*50)
+    
+    print("┌" + "─" * 58 + "┐")
+    print("│ This option (default) will perform the following checks: │")
+    print("└" + "─" * 58 + "┘")
+
+    checks = [
+        "Inspect user shell configuration (rc files) for suspicious patterns",
+        "Analyze PAM authentication modules for credential logging risks",
+        "Scan for suspicious shell command aliases",
+        "Check user .inputrc files for malicious behaviour",
+        "Review user cron jobs and scheduled tasks for persistence risks",
+        "Use of LD_PRELOAD for process injection",
+    ]
+
+    for i, c in enumerate(checks, 1):
+        print(f"{i}) {c}")
+
+    print("\n\033[1mPlease use advanced options for more detailed analysis (see --help)\033[0m")
+    print("-" * 60)
+
     answer = input("\033[1mEnter y\033[0m to continue, or any other key to exit: ").strip().lower()
 
     if answer != "y":
-        print("\nAborted by user.")
+        print("Aborted by user.")
         sys.exit(0)
-    
+
+
     print()
-    print("\033[1m==================================================")
-    print(f"{timestamp} Basic system checks started.".center(50))
-    print("\033[1m==================================================")
+    print("="*60)
+    print(f"{timestamp} Basic system checks started.".center(60))
+    print("="*60)
+
 
     history_patterns = [
+        re.compile(r'history\s*>'),
+        re.compile(r'history\s*>>'),
+        re.compile(r'history\s*\|.*(tee|grep|cat|awk|sed).*'),
+        re.compile(r'script\s+-q\s+.*'),
+        re.compile(r'(ttyrec|asciinema)\s+'),
+        re.compile(r'\b(logkeys|lkl|pykeylogger|keylogger)\b'),
+        re.compile(r'\b(cat|dd|hexdump|od)\s+(/dev/input/event|/proc/bus/input/)'),
+        re.compile(r'\b(xinput\s+test|xev|showkey|evtest|input-events)\b'),
+        re.compile(r'LD_PRELOAD=.*\.so'),
+        re.compile(r'(logkeys|xinput|xev|showkey|script).*[>&]+.*(/tmp/|/var/tmp/|/dev/shm/)'),
+        re.compile(r'(logkeys|keylogger|pykeylogger).*&\s*$'),
+        re.compile(r'(strace|ltrace).*-e.*(read|input|fgets).*'),
+        re.compile(r'(xclip|xsel|pbpaste).*[>&]+'),
+        re.compile(r'(cat|tail)\s+(~/.bash_history|~/.zsh_history|/var/log/.*history)'),
+        re.compile(r'.*[>&]+\s*\.\S+'),
         re.compile(r'alias\s+precmd\s+.*history\s+-S'),
         re.compile(r'.*history\s+>>?\s*/tmp/.*'),
         re.compile(r'.*history\s+>>?\s*\.\w+'),
@@ -2046,29 +2072,65 @@ def intial_system_checks(is_log=False):
         re.compile(r'PROMPT_COMMAND\s*=\s*["\']?.*history\s+-a'),
         re.compile(r'precmd\s*\(\)\s*{.*history\s+.*}'),
         re.compile(r'PROMPT_COMMAND\s*=\s*["\']?[^"\']*;?\s*history\s+-a[^"\']*["\']?'),
+        re.compile(r'(sudo\s+)?history\s+-a'),
     ]
     
     rc_files = pc.list_user_rc_files()
+    found = False
+    suspicious_rc_files = []
+
     if rc_files:
         log("Checking for any suspicious strings in rc files", is_log)
         for file in rc_files:
             if is_log:
                 sys.stdout.write(f"\033[1G{timestamp} Checking RC File - {file}\n")
                 sys.stdout.flush()
-                time.sleep(0.002)
 
             try:
+                file_issues = []
                 with open(file, "r") as f:
                     for line_no, line in enumerate(f, 1):
+                        matched_patterns = []
                         for pattern in history_patterns:
                             if pattern.search(line):
-                                print(f"\n[!] Shell history abuse detected in {file} @ line {line_no}")
-                                print(f"    {line.strip()}\n")
+                                matched_patterns.append("shell history abuse")
                                 found = True
+                        
+                        if matched_patterns:
+                            file_issues.append((line_no, line.strip(), matched_patterns))
+                
+                if file_issues:
+                    suspicious_rc_files.append((file, file_issues))
+                    
             except Exception as e:
-                print(f"{timestamp} [ERROR] Could not read {file}: {e}")
-    if not found:
-        print("\033[1;32mRC Files\033[0m ..................... \033[1;32mOK\033[0m")
+                suspicious_rc_files.append((file, [("ERROR", str(e), ["read error"])]))
+                found = True
+
+    if found:
+        print("\033[1;31mRC Files\033[0m ................................... \033[1;31mWARNING\033[0m")
+        print()
+        print("  ┌─ Shell History Abuse Detected")
+        
+        for i, (rc_file, issues) in enumerate(suspicious_rc_files, 1):
+            print(f"  │")
+            print(f"  ├─ \033[1;37m[{i}] {rc_file}\033[0m")
+            
+            for j, (line_no, content, patterns) in enumerate(issues):
+                is_last_issue = (j == len(issues) - 1)
+                connector = "└─" if is_last_issue else "├─"
+                
+                if line_no == "ERROR":
+                    print(f"  │  {connector} \033[1;31mRead Error:\033[0m {content}")
+                else:
+                    flags = ", ".join(patterns)
+                    print(f"  │  {connector} Line \033[1;33m{line_no}\033[0m: {content}")
+                    print(f"  │  {'  ' if is_last_issue else '│  '} \033[0mFlags:\033[0m {flags}")
+        
+        print("  │")
+        print("  └─ \033[2mReview these RC files, could be used for capturing shell history and other malicious activity\033[0m")
+        print()
+    else:
+        print("\033[1;32mRC Files\033[0m ................................... \033[1;32mOK\033[0m")
 
     pam_files = [
         "/etc/pam.d/system-auth", "/etc/pam.d/password-auth",
@@ -2092,6 +2154,9 @@ def intial_system_checks(is_log=False):
     if is_log:
         print()
     log("Checking for any PAM abuses", is_log)
+    found = False
+    suspicious_pam_files = []
+
     for pam_file in pam_files:
         if os.path.isfile(pam_file):
             timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
@@ -2101,79 +2166,276 @@ def intial_system_checks(is_log=False):
                 time.sleep(0.002)
 
             try:
+                file_issues = []
                 with open(pam_file, "r") as f:
                     for line_no, line in enumerate(f, 1):
+                        matched_patterns = []
                         for pattern in pam_patterns:
                             if pattern.search(line):
-                                print(f"[!] PAM keystroke logging abuse in {pam_file} @ line {line_no}")
-                                print(f"    {line.strip()}")
+                                matched_patterns.append("PAM keystroke logging")
                                 found = True
+                        
+                        if matched_patterns:
+                            file_issues.append((line_no, line.strip(), matched_patterns))
+                
+                if file_issues:
+                    suspicious_pam_files.append((pam_file, file_issues))
+                    
             except Exception as e:
-                print(f"{timestamp} [ERROR] Could not read {pam_file}: {e}")
+                suspicious_pam_files.append((pam_file, [("ERROR", str(e), ["read error"])]))
+                found = True
+
+    if found:
+        print("\033[1;33mPAM Authentication\033[0m ......................... \033[1;31mWARNING\033[0m")
+        print()
+        print("  ┌─ PAM Keystroke Logging Abuse Detected")
+        
+        for i, (pam_file, issues) in enumerate(suspicious_pam_files, 1):
+            print(f"  │")
+            print(f"  ├─ \033[1;37m[{i}] {pam_file}\033[0m")
             
-    if not found:
-        print("\033[1;32mPAM Authentication\033[0m ........... \033[1;32mOK\033[0m")
+            for j, (line_no, content, patterns) in enumerate(issues):
+                is_last_issue = (j == len(issues) - 1)
+                connector = "└─" if is_last_issue else "├─"
+                
+                if line_no == "ERROR":
+                    print(f"  │  {connector} \033[1;31mRead Error:\033[0m {content}")
+                else:
+                    flags = ", ".join(patterns)
+                    print(f"  │  {connector} Line \033[1;33m{line_no}\033[0m: {content}")
+                    print(f"  │  {'   ' if is_last_issue else '│  '} \033[1;31mFlags:\033[0m {flags}")
+        
+        print("  │")
+        print("  └─ \033[2mReview these PAM configurations, could be used for authentication logging\033[0m")
+        print()
+    else:
+        print("\033[1;32mPAM Authentication\033[0m ......................... \033[1;32mOK\033[0m")
 
     log("Checking for suspicious command aliases", is_log)
-    alias_pattern = re.compile(r'alias\\s+(sudo|ssh|su|nano|vim)\\s*=')
+    alias_patterns = [
+    re.compile(r'alias\s+\w+\s*=.*(logkeys|lkl|keylogger|pykeylogger)'),
+    re.compile(r'alias\s+\w+\s*=.*(xinput\s+test|xev|showkey)'),
+    re.compile(r'alias\s+\w+\s*=.*(/dev/input/event|/proc/bus/input/)'),
+    re.compile(r'alias\s+\w+\s*=.*(keylog|keystroke|inputlog|keypress)'),
+    re.compile(r'alias\s+\w+\s*=.*(strace.*-e.*read.*event|ltrace.*input)'),
+    re.compile(r'alias\s+\w+\s*=.*(script\s+-q|ttyrec|asciinema)'),
+    re.compile(r'alias\s+\w+\s*=.*(xclip.*-o|xsel.*-o|pbpaste).*>'),
+    ]
+    direct_keylogger_patterns = [
+    re.compile(r'(^|\s|;|&|\|)(logkeys|lkl|keylogger|pykeylogger)\s'),
+    re.compile(r'(^|\s|;|&|\|)(xinput\s+test|xev|showkey)\s'),
+    re.compile(r'(cat|dd|hexdump|od)\s+(/dev/input/event|/proc/bus/input/)'),
+    re.compile(r'(xinput|xev|showkey|logkeys).*[>&]+.*(/tmp/|/var/tmp/|/dev/shm/)'),
+    re.compile(r'(strace|ltrace).*-e.*(read|input).*event'),
+    re.compile(r'(script|ttyrec|asciinema).*[>&]+.*\w+'),
+    re.compile(r'(logkeys|keylogger|pykeylogger).*&\s*$'),
+    ]
+    
+    found = False
+    suspicious_rc_files = []
     for file in rc_files:
         try:
+            file_issues = []
             with open(file, "r") as f:
                 for line_no, line in enumerate(f, 1):
-                    if alias_pattern.search(line):
-                        print(f"[!] Suspicious alias in {file} @ line {line_no}")
-                        print(f"    {line.strip()}")
-                        found = True
+                    if line.strip() and not line.strip().startswith('#'):
+                        matched_patterns = []
+
+                        for i, pattern in enumerate(alias_patterns):
+                            if pattern.search(line):
+                                if i == 0:
+                                    matched_patterns.append("keylogger alias")
+                                elif i == 1:
+                                    matched_patterns.append("X11 input alias")
+                                elif i == 2:
+                                    matched_patterns.append("/dev/input device alias")
+                                elif i == 3:
+                                    matched_patterns.append("keystroke logging alias")
+                                elif i == 4:
+                                    matched_patterns.append("input tracing alias")
+                                elif i == 5:
+                                    matched_patterns.append("session recording alias")
+                                elif i == 6:
+                                    matched_patterns.append("clipboard keylogger alias")
+                        
+                        for i, pattern in enumerate(direct_keylogger_patterns):
+                            if pattern.search(line):
+                                if i == 0:
+                                    matched_patterns.append("direct keylogger execution")
+                                elif i == 1:
+                                    matched_patterns.append("direct X11 input monitoring")
+                                elif i == 2:
+                                    matched_patterns.append("direct /dev/device file reading")
+                                elif i == 3:
+                                    matched_patterns.append("keystroke capture to file")
+                                elif i == 4:
+                                    matched_patterns.append("direct input tracing")
+                                elif i == 5:
+                                    matched_patterns.append("direct session recording")
+                                elif i == 6:
+                                    matched_patterns.append("running keylogger in background")
+                        
+                        if matched_patterns:
+                            file_issues.append((line_no, line.strip(), matched_patterns))
+                            found = True
+            
+            if file_issues:
+                suspicious_rc_files.append((file, file_issues))
+                
         except Exception as e:
-            print(f"[ERROR] Could not read {file}: {e}")
-    
-    if not found:
-        print("\033[1;32mShell Aliases\033[0m ................ \033[1;32mOK\033[0m")
+            suspicious_rc_files.append((file, [("ERROR", str(e), ["read error"])]))
+            found = True
+
+    if found:
+        print("\033[1;31mShell Aliases\033[0m .............................. \033[1;31mWARNING\033[0m")
+        print()
+        print("  ┌─ Keylogger-Related Commands Detected")
+        
+        for i, (file_path, issues) in enumerate(suspicious_rc_files, 1):
+            print(f"  │")
+            print(f"  ├─ \033[1;37m[{i}] {file_path}\033[0m")
+            
+            for j, (line_no, content, patterns) in enumerate(issues):
+                is_last_issue = (j == len(issues) - 1)
+                connector = "└─" if is_last_issue else "├─"
+                
+                if line_no == "ERROR":
+                    print(f"  │  {connector} \033[1;31mRead Error:\033[0m {content}")
+                else:
+                    flags = ", ".join(patterns)
+                    print(f"  │  {connector} Line \033[1;33m{line_no}\033[0m: {content}")
+                    print(f"  │  {'  ' if is_last_issue else '│  '} \033[0mFlags:\033[0m {flags}")
+        
+        print("  │")
+        print("  └─ \033[2mReview these commands, could be keylogger\033[0m")
+        print()
+    else:
+        print("\033[1;32mShell Aliases\033[0m .............................. \033[1;32mOK\033[0m")
     
     log("Checking ~/.inputrc for potential abuse", is_log)
+    found = False
+    suspicious_irc_files = []
+
     for home in pc.get_existing_user_homes():
         inputrc_path = os.path.join(home, ".inputrc")
         if os.path.isfile(inputrc_path):
             try:
+                file_issues = []
                 with open(inputrc_path, "r") as f:
                     for line_no, line in enumerate(f, 1):
-                        if "shell:" in line or "readline" in line:
-                            print(f"[!] Suspicious line in {inputrc_path} @ line {line_no}")
-                            print(f"    {line.strip()}")
-                            found = True
+                        if line.strip() and not line.strip().startswith('#'):
+                            suspicious_patterns = []
+                            line_lower = line.lower().strip()
+                            
+                            if "shell:" in line or "readline" in line:
+                                suspicious_patterns.append("shell or readline usage")
+                            
+                            if any(pattern in line for pattern in ["`", "$("]):
+                                suspicious_patterns.append("command substitution")
+                            
+                            if any(cmd in line_lower for cmd in ["exec", "system", "eval"]):
+                                suspicious_patterns.append("command execution")
+                            
+                            if any(net in line_lower for net in ["wget", "curl", "nc", "netcat", "telnet"]):
+                                suspicious_patterns.append("network tool usage")
+                            
+                            if any(proto in line_lower for proto in ["http://", "https://", "ftp://"]):
+                                suspicious_patterns.append("Refering a URL")
+                            
+                            if any(path in line_lower for path in ["/tmp/", "/var/tmp/", "/dev/shm/"]):
+                                suspicious_patterns.append("suspicious path")
+                            
+                            if any(cmd in line_lower for cmd in ["chmod", "chown", "sudo", "su"]):
+                                suspicious_patterns.append("privilege or permission change")
+                            
+                            if len(line.strip()) > 50 and line.count('=') <= 2:
+                                if all(c.isalnum() or c in '+/=' for c in line.strip()):
+                                    suspicious_patterns.append("possible encoded content")
+                            
+                            if any(src in line_lower for src in ["source ", ". /"]):
+                                suspicious_patterns.append("externally sourcing file")
+                            
+                            if suspicious_patterns:
+                                file_issues.append((line_no, line.strip(), suspicious_patterns))
+                                found = True
+                
+                if file_issues:
+                    suspicious_irc_files.append((inputrc_path, file_issues))
+                    
             except Exception as e:
-                print(f"[ERROR] Could not read {inputrc_path}: {e}")
+                suspicious_irc_files.append((inputrc_path, [("ERROR", str(e), ["read error"])]))
+                found = True
 
-    if not found:
-        print("\033[1;32minputrc Inspection\033[0m ........... \033[1;32mOK\033[0m")
+    if found:
+        print("\033[1;31mInputrc Inspection\033[0m ......................... \033[1;31mWARNING\033[0m")
+        print()
+        print("  ┌─ Suspicious .inputrc Files Detected")
+        
+        for i, (inputrc_path, issues) in enumerate(suspicious_irc_files, 1):
+            print(f"  │")
+            print(f"  ├─ \033[1;37m[{i}] {inputrc_path}\033[0m")
+            
+            for j, (line_no, content, patterns) in enumerate(issues):
+                is_last_issue = (j == len(issues) - 1)
+                connector = "└─" if is_last_issue else "├─"
+                
+                if line_no == "ERROR":
+                    print(f"  │  {connector} \033[1;31mRead Error:\033[0m {content}")
+                else:
+                    flags = ", ".join(patterns)
+                    print(f"  │  {connector} Line \033[1;33m{line_no}\033[0m: {content}")
+                    print(f"  │  {'  ' if is_last_issue else '│  '} \033[0mFlags:\033[0m {flags}")
+        
+        print("  │")
+        print("  └─ \033[2mReview these, could be for a potential command injection and malicious activity\033[0m")
+        print()
+    else:
+        print("\033[1;32mInputrc Inspection\033[0m ......................... \033[1;32mOK\033[0m")
+
 
     log("Checking Cron jobs for potential keyloggers", is_log)
 
-    #TODO: Improve below, instead of just saying to review manually
+    #TODO: need to add check for any suspicious strings.. but could create noice.. so have to think about it.
     _, susp_entries = pc.check_cron_jobs(is_log)
     
     if susp_entries:
-        print("\033[1;33mCron Job Analysis\033[0m ............ \033[1;31mWARNING\033[0m\n")
-        print("    Suspicious cron jobs detected:")
-        for entry in susp_entries:
+        print("\033[1;31mCron Job Analysis\033[0m .......................... \033[1;31mWARNING\033[0m")
+        print()
+        print("  ┌─ Suspicious Cron Jobs Detected")
+        
+        for i, entry in enumerate(susp_entries, 1):
             source = entry.get("file") or f"user: {entry.get('user', 'unknown')}"
-            print(f"        - {source}")
-            print(f"            Schedule/Command: {entry['line']}")
+            print(f"  │")
+            print(f"  ├─ \033[1;37m[{i}] {source}\033[0m")
+            print(f"  │  ├─ Schedule/Command: \033[1;33m{entry['line']}\033[0m")
+            
             if entry['signals']:
-                print(f"            Flags: {', '.join(entry['signals'])}")
-            for spath, sus_string in entry["script_hits"]:
-                print(f"            >>> Suspicious string found in: {spath}")
-                print(f"                Pattern: {sus_string!r}")
-            print()
+                print(f"  │  ├─ Flags: {', '.join(entry['signals'])}")
+            
+            if entry["script_hits"]:
+                print(f"  │  └─ Suspicious Content:")
+                for j, (spath, sus_string) in enumerate(entry["script_hits"]):
+                    is_last_hit = (j == len(entry["script_hits"]) - 1)
+                    connector = "└─" if is_last_hit else "├─"
+                    print(f"  │     {connector} Script: {spath}")
+                    print(f"  │     {'   ' if is_last_hit else '│  '} Pattern: {sus_string!r}")
+            else:
+                print(f"  │  └─ Flags: {', '.join(entry['signals'])}" if entry['signals'] else "")
+        
+        print("  │")
+        print("  └─ \033[2mReview these entries\033[0m")
+        print()
     else:
-        print("\033[1;32mCron Job Analysis\033[0m ............ \033[1;32mOK\033[0m")
+        print("\033[1;32mCron Job Analysis\033[0m .......................... \033[1;32mOK\033[0m")
 
     score, found_pids = pc.check_ld_preload()
     if score == 0:
-        print("\033[1;32mLD_PRELOAD Usage\033[0m ............. \033[1;32mOK\033[0m")
+        print("\033[1;32mLD_PRELOAD Usage\033[0m ...................................  \033[1;32mOK\033[0m")
         print("    No unusual or unauthorized usage detected.\n")
     elif score == 1:
-        print("\033[1;33mLD_PRELOAD Usage\033[0m ............. \033[1;33mPossible Issue\033[0m")
+        print("\033[1;33mLD_PRELOAD Usage\033[0m ........................... \033[1;33mPossible Issue\033[0m")
+        print()
+        print("  ┌─ Unusual LD_PRELOAD Usage Detected")
         bin_pid_map = collections.defaultdict(list)
         for pid in found_pids:
             try:
@@ -2182,15 +2444,21 @@ def intial_system_checks(is_log=False):
                 bin_pid_map[binary_path].append(pid)
             except Exception:
                 continue
-        print("    Possible unusual LD_PRELOAD use detected. Review the following binaries in use:")
+        
         for binary_path, pids in bin_pid_map.items():
-            print(f"        Binary Path: {binary_path} (PID count: {len(pids)})")
+            print(f"  │")
+            print(f"  ├─ \033[1;37m{binary_path}\033[0m")
+            print(f"  │  └─ Process Count: \033[1;33m{len(pids)}\033[0m")
             if len(pids) <= 3:
-                print(f"            PIDs: {', '.join(str(pid) for pid in pids)}")
+                print(f"  │     PIDs: {', '.join(str(pid) for pid in pids)}")
             else:
                 shown = ', '.join(str(pid) for pid in pids[:3])
-                print(f"            PIDs: {shown} ... (and {len(pids)-3} more)")
-        print("    If unsure, please use -p option for full details.\n")
+                print(f"  │     PIDs: {shown} ... (+{len(pids)-3} more)")
+        
+        print("  │")
+        print("  └─ \033[2mUse -p PID for detailed analysis\033[0m")
+        print()
+
 
 def log(msg, is_log_enabled):
     if is_log_enabled:
@@ -2217,6 +2485,20 @@ if __name__ == "__main__":
     require_root()
     args = parse_args()
     m = BinaryAnalyzer()
+
+    banner = r"""
+    ▄████████    ▄█   ▄█▄    ▄████████ ▄██   ▄    ▄█        ▄██████▄     ▄██████▄     ▄██████▄     ▄████████    ▄████████      
+    ███    ███   ███ ▄███▀   ███    ███ ███   ██▄ ███       ███    ███   ███    ███   ███    ███   ███    ███   ███    ███      
+    ███    █▀    ███▐██▀     ███    █▀  ███▄▄▄███ ███       ███    ███   ███    █▀    ███    █▀    ███    █▀    ███    ███      
+    ▄███▄▄▄      ▄█████▀     ▄███▄▄▄     ▀▀▀▀▀▀███ ███       ███    ███  ▄███         ▄███         ▄███▄▄▄      ▄███▄▄▄▄██▀      
+    ▀▀███▀▀▀     ▀▀█████▄    ▀▀███▀▀▀     ▄██   ███ ███       ███    ███ ▀▀███ ████▄  ▀▀███ ████▄  ▀▀███▀▀▀     ▀▀███▀▀▀▀▀        
+    ███          ███▐██▄     ███    █▄  ███   ███ ███       ███    ███   ███    ███   ███    ███   ███    █▄  ▀███████████      
+    ███          ███ ▀███▄   ███    ███ ███   ███ ███▌    ▄ ███    ███   ███    ███   ███    ███   ███    ███   ███    ███      
+    ███          ███   ▀█▀   ██████████  ▀█████▀  █████▄▄██  ▀██████▀    ████████▀    ████████▀    ██████████   ███    ███      
+                ▀                                ▀                                                             ███    ███  
+    """
+
+    print("\033[1;34m" + banner + "\033[0m")
 
     if args.scan:
         try:
