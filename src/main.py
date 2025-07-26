@@ -20,6 +20,7 @@ import signal
 from datetime import datetime
 import re
 import collections
+import itertools
 
 file_path = "process.json"
 white_list_ports = [8080, 443, 22]
@@ -920,12 +921,13 @@ class BPFMONITOR:
                 for line in f:
                     try:
                         entry = json.loads(line)
-                        if pid == entry.get("pid") and entry.get("pid") != str(CURRENT_PID):
+                        if str(pid) == entry.get("pid") and entry.get("pid") != str(CURRENT_PID):
                             return True
                     except Exception as e:
                         print(f"{e}")
+                        return False
         except FileNotFoundError:
-            pass
+            return False
         except Exception as e:
             print(f"{e}")
             return False
@@ -989,47 +991,60 @@ def has_suspicious_modules(binary, lib):
                     yield line.lower()
         except Exception:
             return
+
     try:
+        patterns = {
+            lib_name: re.compile(r'\b' + re.escape(lib_name) + r'\b')
+            for lib_name in lib.keys()
+        }
+
         for line in lines():
-            for libraries, weight in lib.items():
-                if str(libraries) in str(line):
-                    return libraries, weight
+            for lib_name, pattern in patterns.items():
+                if pattern.search(line):
+                    return lib_name, lib[lib_name]
         return None, 0
     except Exception:
         return None, 0
 
+
 def has_suspicious_strings(binary_path):
-    sus_names = [
-        b"/dev/input/event",
-        b"XOpenDisplay",
-        b"XQueryKeymap",
-        b"XRecordCreateContext",
-        b"keylogger",
-        b"keystroke",
-        b"grab_keyboard",
-        b"libX11.so",
-        b"libXtst.so",
-        b"raw_input",
-        b"input_event",
-        b"KeyPress",
-        b"keyboard.h",
-        b"log_keys",
-        b"proc",
-        b"SendInput",
-        b"RecordKey",
-        b"input_log",
-        b"KeyLogger",
-        b"keyboard_read",
-        b"hook_keyboard",
+    sus_patterns = [
+        r"/dev/input/event\d*",
+        r"xopendisplay",
+        r"xquerykeymap",
+        r"xrecordcreatecontext",
+        r"keylogger",
+        r"keystroke",
+        r"grab_keyboard",
+        r"libx11\.so",
+        r"libxtst\.so",
+        r"raw_input",
+        r"input_event",
+        r"keypress",
+        r"keyboard\.h",
+        r"log_keys",
+        r"sendinput",
+        r"recordkey",
+        r"input_log",
+        r"keylogger",
+        r"keyboard_read",
+        r"hook_keyboard",
     ]
+
     try:
-        with open(binary_path, 'rb') as f:
-            content = f.read()
-            for name in sus_names:
-                if name in content:
-                    return True, name
+        output = subprocess.check_output(
+            ["strings", binary_path],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5
+        ).lower()
+
+        for name in sus_patterns:
+            pattern = re.compile(r'\b' + re.escape(name.lower()) + r'\b')
+            if pattern.search(output):
+                return True, name.encode()
     except Exception as e:
-        print(f"    [ERROR] Failed to scan {binary_path}: {e}")
+        print(f"[ERROR] Failed to scan {binary_path}: {e}")
     return False, None
 
 def get_path(cwd, cmdline, exe_path):
@@ -1428,7 +1443,7 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
         libraries, rt = has_suspicious_modules(full_path, sus_libraries)
         if rt:
             sus_score += 2
-            reasons.append(f"Contains suspicious strings: {libraries}")
+            reasons.append(f"Contains suspicious modules: {libraries}")
 
         if full_path in known_safe_programs or any(full_path.startswith(wp) for wp in white_list_paths):
             check = True
@@ -1479,6 +1494,7 @@ def scan_process(is_log=False, target_pid=None):
     timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
 
     print(f"{timestamp} Scanning Started.")
+
     log("Starting monitoring using BPF for 5 seconds", is_log)
     bpf.start(5)
     bpf.stop()
@@ -1515,14 +1531,14 @@ def scan_process(is_log=False, target_pid=None):
                 confidence, access_rate = x.check_x11_connection(target_pid)
                 if confidence >= 3 and access_rate > 0:
                     suspicious_candidates.add(target_pid)
-                    reasons_by_pid[target_pid].add("Has X11 access")
+                    reasons_by_pid[target_pid].add("Has input access through X11")
                     log(f"X11 access activity detected for PID {target_pid} (confidence: {confidence}, rate: {access_rate})", is_log)
                 parent_map[target_pid] = p.ppid()
 
                 if target_pid in input_access_pids:
                     suspicious_candidates.add(target_pid)
                     reasons_by_pid[target_pid].add("Accessing Input Devices")
-                    if bpf.check_pid(target_pid):
+                    if target_pid is not None and bpf.check_pid(target_pid):
                         reasons_by_pid[target_pid].add("Accessing Input Devices confirmed using - BPF")
                         print(f"{timestamp} Input Devices access detected using BPF for PID {target_pid}")
 
@@ -1549,7 +1565,7 @@ def scan_process(is_log=False, target_pid=None):
                     confidence, access_rate = x.check_x11_connection(p.pid)
                     if confidence >= 3 and access_rate > 0:
                         suspicious_candidates.add(p.pid)
-                        reasons_by_pid[p.pid].add("Has X11 access")
+                        reasons_by_pid[p.pid].add("Has input access through X11")
                         log(f"X11 access activity detected for PID {p.pid}", is_log)
                     parent_map[p.pid] = p.ppid()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -1558,7 +1574,7 @@ def scan_process(is_log=False, target_pid=None):
 
             for pid in input_access_pids:
                 suspicious_candidates.add(pid)
-                reasons_by_pid[pid].add("input access")
+                reasons_by_pid[pid].add("Has direct input access")
                 if bpf.check_pid(pid):
                     reasons_by_pid[pid].add("BPF activity")
                     print(f"{timestamp} Input Devices access detected using BPF for PID {target_pid}")
@@ -1601,31 +1617,46 @@ def scan_process(is_log=False, target_pid=None):
 
 def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False, s_pid=False, is_log_enabled=False):
     if trusted_paths and scan and not s_pid:
-        print("\n" + "-" * 50)
-        print(" Trusted Processes Using Input Devices ".center(50))
-        print("-" * 50)
-        for path in sorted(set(trusted_paths)):
-            print(f" ─ {path}")
+        print()
+        print("\033[1;34m┌" + "─" * 58 + "┐\033[0m")
+        print("\033[1;34m│" + "Trusted Processes Using Input Devices".center(58) + "│\033[0m")
+        print("\033[1;34m└" + "─" * 58 + "┘\033[0m")
+
+        trusted_list = sorted(set(trusted_paths))
+        for idx, path in enumerate(trusted_list, 1):
+            group = "System" if path.startswith("/usr") else "User"
+            symbol = "╰─" if idx == len(trusted_list) else "├─"
+            print(f" {symbol} {path} (\033[1;36m{group}\033[0m)")
 
     if unrecognized_paths and scan and not s_pid:
-        print("\n" + "-" * 50)
-        print(" Unrecognized Processes Using Input Devices ".center(50))
-        print("-" * 50)
-        for path in sorted(set(unrecognized_paths)):
-            print(f" ─ {path}")
+        print()
+        print("\033[1;34m┌" + "─" * 58 + "┐\033[0m")
+        print("\033[1;34m│" + "Unrecognized Processes Using Input Devices".center(58) + "│\033[0m")
+        print("\033[1;34m└" + "─" * 58 + "┘\033[0m")
+
+        unrec_list = sorted(set(unrecognized_paths))
+        for idx, path in enumerate(unrec_list, 1):
+            symbol = "╰─" if idx == len(unrec_list) else "├─"
+            print(f" {symbol} {path}")
 
     if suspicious_pids and scan and not s_pid:
-        print("\n" + "-" * 50)
-        print(" Running Checks on Unrecognized Processes ".center(50))
-        print("-" * 50)
+        print()
+        print("\033[1;34m┌" + "─" * 58 + "┐\033[0m")
+        print("\033[1;34m│" + "Running Checks on Unrecognized Processes".center(58) + "│\033[0m")
+        print("\033[1;34m└" + "─" * 58 + "┘\033[0m")
+
         checks = [
             "Process has any suspicious strings",
             "Process reading/writing to any file",
             "Process has opened any foreign connections",
             "Process is persistent"
         ]
-        for c in checks:
-            print(f" ─ {c}")
+
+        for idx, c in enumerate(checks, 1):
+            symbol = "╰─" if idx == len(checks) else "├─"
+            print(f" {symbol} {c}")
+
+
 
     for pid in list(suspicious_pids):
         if fm.check_file_activity(pid, 1):
@@ -1652,21 +1683,17 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
     normal_suspects = []
     sus_scores = {}
     child_group = defaultdict(list)
-
+    
     for pid in suspicious_pids:
         path = fullpaths.get(pid)
         if path:
             module_name, sus_score = has_suspicious_modules(path, load_sus_libraries())
             sus_scores[pid] = sus_score
-            if sus_score and module_name:
-                if sus_score >= 4:
-                    high_sus_string_pids.append(pid)
-                    reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
-                elif sus_score > 0:
-                    normal_suspects.append(pid)
-                    reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
-                else:
-                    normal_suspects.append(pid)
+            if sus_score and module_name and sus_score >= 4:
+                high_sus_string_pids.append(pid)
+                reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
+            else:
+                normal_suspects.append(pid)
 
     final_suspects = list(set(high_sus_string_pids + normal_suspects))
     final_suspects = [pid for pid in final_suspects if pid in fullpaths]
@@ -1679,6 +1706,7 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
         else:
             printed_pids.add(pid)
 
+    # Single Pid part
     if s_pid:
         for pid in sorted(final_suspects):
             try:
@@ -1692,42 +1720,46 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
                         parent_path = os.path.basename(parent.exe())
                     except Exception:
                         pass
-
-                print("\n" + "=" * 50)
-                print(" POTENTIAL KEYLOGGER DETECTED ".center(50))
-                print("=" * 50)
-                print(f"\n PID {pid}: {binary}  (Parent: {parent_path})")
-
+                
+                print()
+                print("\033[1;31m┌" + "─" * 58 + "┐\033[0m")
+                print("\033[1;31m│" + " POTENTIAL KEYLOGGER(S) DETECTED ".center(58) + "│\033[0m")
+                print("\033[1;31m└" + "─" * 58 + "┘\033[0m")
+              
                 reason_list = sorted(reasons_by_pid.get(pid, []))
                 if reason_list:
-                    print(" ├─ Flagged due to:")
+                    print(" ├─ \033[1;33mFlagged due to:\033[0m")
                     for idx, reason in enumerate(reason_list):
-                        symbol = "└─" if idx == len(reason_list) - 1 else "├─"
-                        print(f" │   {symbol} {reason}")
+                        symbol = "╰─" if idx == len(reason_list) - 1 else "├─"
+                        print(f" │  {symbol} {reason}")
                 else:
                     print(" ├─ Reasons: None found")
 
                 print("\n ├─ Binary Path:")
                 print(f" │   {path}")
 
-                if pid in child_group:
+                if pid in child_group and child_group[pid]:
                     print("\n └─ Child Processes:")
                     for idx, child_pid in enumerate(sorted(child_group[pid])):
                         child_path = fullpaths.get(child_pid, '[unknown path]')
-                        symbol = "└─" if idx == len(child_group[pid]) - 1 else "├─"
+                        symbol = "╰─" if idx == len(child_group[pid]) - 1 else "├─"
                         print(f"     {symbol} PID {child_pid}: {child_path}")
                 else:
                     print("\n └─ Child Processes: None")
+                    
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 print(f"[PID {pid}]  <process info unavailable>")
 
+
     if s_pid and not final_suspects:
         print(f"[*] No suspicious activity found in the given PID")
-
+    
+    # Sscan Part
     elif printed_pids and scan and not s_pid:
-        print("\n" + "-" * 50)
-        print(" POTENTIAL KEYLOGGER(S) DETECTED ".center(50))
-        print("-" * 50)
+        print()
+        print("\033[1;31m┌" + "─" * 58 + "┐\033[0m")
+        print("\033[1;31m│" + " POTENTIAL KEYLOGGER(S) DETECTED ".center(58) + "│\033[0m")
+        print("\033[1;31m└" + "─" * 58 + "┘\033[0m")
 
         for pid_group in [high_sus_string_pids, printed_pids - set(high_sus_string_pids)]:
             for pid in sorted(pid_group):
@@ -1739,52 +1771,72 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
                     trust_note = " (recognized system binary)" if is_trusted else ""
 
                     print(f"\n [PID {pid}] {path}{trust_note}")
+
                     ppid = p.ppid()
                     try:
                         parent = psutil.Process(ppid)
                         parent_path = parent.exe()
                         parent_trust = ba.is_trusted_binary(parent_path)
-                        print(f"     ├─ Parent PID {ppid}: {parent_path} ({'trusted' if parent_trust else 'untrusted'})")
+                        parent_status = "trusted" if parent_trust else "\033[1;31muntrusted\033[0m"
+                        print(f"     ├─ Parent PID {ppid}: {parent_path} ({parent_status})")
                     except Exception:
                         print(f"     ├─ Parent PID {ppid}: <unknown>")
-                    if pid in child_group:
-                        for child_pid in sorted(child_group[pid]):
-                            child_path = fullpaths.get(child_pid, '[unknown path]')
-                            print(f"     ├─ Child PID {child_pid}: {child_path}")
 
-                    print(f"     ├─ Flagged due to:")
-                    for reason in reason_list:
-                        print(f"         • {reason}")
+                    if pid in child_group and child_group[pid]:
+                        for idx, child_pid in enumerate(sorted(child_group[pid])):
+                            child_path = fullpaths.get(child_pid, '[unknown path]')
+                            symbol = "└─" if idx == len(child_group[pid]) - 1 else "├─"
+                            print(f"     ├─ Child PID {child_pid}: {child_path}")
+                    else:
+                        print("     ├─ Child Processes: None")
+
+                    print("     ╭─ \033[1;33mFlagged due to:\033[0m")
+
+                    for idx, reason in enumerate(reason_list):
+                        symbol = "╰─" if idx == len(reason_list) - 1 else "├─"
+                        print(f"     │  {symbol} {reason}")
+
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     print(f" [PID {pid}]  <process info unavailable>")
+
+
 
     elif not printed_pids and scan:
         print("\n" + "-" * 50)
         print(" No suspicious keylogger activity found. ".center(50))
         print("-" * 50)
 
+
+    # Monitor part
     elif not scan and not s_pid and printed_pids:
-        print("\n")
-        print("POTENTIAL KEYLOGGER(S) DETECTED:")
-        for pid_group in [high_sus_string_pids, printed_pids - set(high_sus_string_pids)]:
-            for pid in sorted(pid_group):
-                path = fullpaths.get(pid, '[unknown path]')
-                binary = os.path.basename(path)
+        print()
+        print("\033[1;31m┌" + "─" * 50 + "┐\033[0m")
+        print("\033[1;31m│" + " POTENTIALIAL KEYLOGGER(S) DETECTED ".center(50) + "│\033[0m")
+        print("\033[1;31m└" + "─" * 50 + "┘\033[0m")
 
-                ppid = parent_map.get(pid, None)
-                parent_path = '[unknown]'
-                if ppid:
-                    try:
-                        parent = psutil.Process(ppid)
-                        parent_path = os.path.basename(parent.exe())
-                    except Exception:
-                        pass
+        for pid in sorted(printed_pids):
+            path = fullpaths.get(pid, '[unknown path]')
+            binary = os.path.basename(path)
 
-                print(f"[PID {pid}] {binary} - {parent_path}")
-                reason_list = sorted(reasons_by_pid.get(pid, []))
-                for reason in reason_list:
-                    print(f"     └─ {reason}")
-                print("\n")
+            parent_path = '[unknown]'
+            ppid = parent_map.get(pid, None)
+            if ppid:
+                try:
+                    parent = psutil.Process(ppid)
+                    parent_path = os.path.basename(parent.exe())
+                except Exception:
+                    pass
+
+            print(f"\033[1;36mPID {pid}\033[0m: {binary} (Parent: {parent_path})")
+
+            reason_list = sorted(reasons_by_pid.get(pid, []))
+            print(" ├─ \033[1;33mFlagged due to:\033[0m")
+            
+            for idx, reason in enumerate(reason_list):
+                symbol = "╰─" if idx == len(reason_list) - 1 else "├─"
+                print(f" │  {symbol} {reason}")
+            print()
+
 
 
 def pid_is_trusted(pid, hash):
@@ -1809,17 +1861,17 @@ def pid_is_trusted(pid, hash):
 
 # --monitor option
 def phase_one_analysis(interval=5, is_log_enabled=False, scan_all=False):
-    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    spinner = itertools.cycle(['-', '\\', '|', '/'])
 
-    print(f"{timestamp} Monitoring Started.")
-    print(f"{timestamp} Scan interval - {interval}s")
-    print(f"{timestamp} Monitoring processes for suspicious activity.")
+    print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Monitoring Started.")
+    print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scan interval - {interval}s")
+    print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Monitoring processes for suspicious activity.")
 
     if is_log_enabled:
          if scan_all:
-             print(f"{timestamp} Scanning all processes, including those marked as trusted.")
+             print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning all processes, including those marked as trusted.")
          else:
-             print(f"{timestamp} Skipping processes trusted by program heuristics or user configuration.")
+             print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Skipping processes trusted by program heuristics or user configuration.")
 
     while True:
         i = InputMonitor()
@@ -1830,7 +1882,7 @@ def phase_one_analysis(interval=5, is_log_enabled=False, scan_all=False):
         bpf.start(5)
         bpf.stop()
         path_check = set()
-        for proc in psutil.process_iter(['pid', 'cmdline', 'exe', 'cwd']):
+        for index, proc in enumerate(psutil.process_iter(['pid', 'cmdline', 'exe', 'cwd'])):
             pid = proc.info['pid']
             try:
                 cwd = proc.cwd()
@@ -1849,11 +1901,11 @@ def phase_one_analysis(interval=5, is_log_enabled=False, scan_all=False):
             if not p or skip_current_pid(p, pid):
                 continue
 
-
             sys.stdout.write(f"\033[1G")
-            sys.stdout.write(f"{timestamp} Scanning PID - {pid:<6}")
+            sys.stdout.write(f"\033[1G{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning PID - {pid:<6} ({index}) {next(spinner)}")
             sys.stdout.flush()
-
+            
+            #TODO: have to think about whether to skip the processes that are already processed? 
             if not scan_all:
                 file_hash = get_file_hash(p)
                 if not pid_is_trusted(pid, file_hash):
@@ -1881,7 +1933,7 @@ def phase_one_analysis(interval=5, is_log_enabled=False, scan_all=False):
                         if not hash_and_save(p, pid, name, 0, False):
                             print(f"[ERROR] Failed to update {file_path}")
 
-        print(f"\n{timestamp} Sleeping - {interval}s")
+        print(f"\n{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Sleeping - {interval}s")
         time.sleep(interval)
 
 def change_and_join(reasons):
@@ -1917,7 +1969,7 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
     confidence, access_rate = x.check_x11_connection(pid)
     if confidence >= 3 and access_rate > 0:
         suspicious_candidates.add(pid)
-        reasons_by_pid[pid].add("Has X11 access")
+        reasons_by_pid[pid].add("Has input access through X11")
         log(f"Using X11 to access Input devices for PID - {pid}", is_log_enabled)
 
     for pid, input_device_path in input_access_pids.items():
@@ -1927,8 +1979,10 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
         else:
             reasons_by_pid[pid].add("Has Input Access")
 
-        if bpf.check_pid(pid):
+        output = bpf.check_pid(pid)
+        if output:
             reasons_by_pid[pid].add("Input Access verified using - BPF")
+
             log(f"Input Devices access detected using BPF for PID {pid}", is_log_enabled)
 
     for pid in suspicious_candidates:
