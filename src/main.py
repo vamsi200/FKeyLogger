@@ -1491,9 +1491,8 @@ def scan_process(is_log=False, target_pid=None):
     pc = PersistenceChecker()
     ipc = IPCScanner()
     nm = NetworkMonitor()
-    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
 
-    print(f"{timestamp} Scanning Started.")
+    print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning Started.")
 
     log("Starting monitoring using BPF for 5 seconds", is_log)
     bpf.start(5)
@@ -1509,8 +1508,8 @@ def scan_process(is_log=False, target_pid=None):
 
     log(f"PID's accessing /dev/input/ ", is_log)
     
-    print(f"{timestamp} Found {len(input_access_pids)} PID's accessing /dev/input.")
-    
+    print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Found {len(input_access_pids)} PID's accessing /dev/input.")
+
     if input_access_pids and is_log:
         for input, _ in input_access_pids.items():
             print(f"    •  {input}", is_log)
@@ -1526,7 +1525,7 @@ def scan_process(is_log=False, target_pid=None):
     try:
         if target_pid is not None:
             try:
-                print(f"{timestamp} Scanning PID - {target_pid}")
+                print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning PID - {target_pid}")
                 p = psutil.Process(target_pid)
                 confidence, access_rate = x.check_x11_connection(target_pid)
                 if confidence >= 3 and access_rate > 0:
@@ -1540,7 +1539,7 @@ def scan_process(is_log=False, target_pid=None):
                     reasons_by_pid[target_pid].add("Accessing Input Devices")
                     if target_pid is not None and bpf.check_pid(target_pid):
                         reasons_by_pid[target_pid].add("Accessing Input Devices confirmed using - BPF")
-                        print(f"{timestamp} Input Devices access detected using BPF for PID {target_pid}")
+                        print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID - {target_pid}")
 
                 path = get_path(p.cwd(), p.cmdline(), p.exe())
                 if path:
@@ -1559,7 +1558,7 @@ def scan_process(is_log=False, target_pid=None):
                 print(f"[ERROR] PID {target_pid} is not accessible.")
                 return
         else:
-            print(f"{timestamp} Trying to find KeyLogger(s)")
+            print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Trying to find KeyLogger(s)")
             for p in psutil.process_iter(['pid', 'ppid']):
                 try:
                     confidence, access_rate = x.check_x11_connection(p.pid)
@@ -1577,7 +1576,7 @@ def scan_process(is_log=False, target_pid=None):
                 reasons_by_pid[pid].add("Has direct input access")
                 if bpf.check_pid(pid):
                     reasons_by_pid[pid].add("BPF activity")
-                    print(f"{timestamp} Input Devices access detected using BPF for PID {target_pid}")
+                    print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID {target_pid}")
 
             for pid in suspicious_candidates:
                 try:
@@ -2062,8 +2061,8 @@ def prompt_user_trust_a_process():
 
 def intial_system_checks(is_log=False):
     pc = PersistenceChecker()
-    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
     
+
     print("┌" + "─" * 58 + "┐")
     print("│ This option (default) will perform the following checks: │")
     print("└" + "─" * 58 + "┘")
@@ -2092,7 +2091,7 @@ def intial_system_checks(is_log=False):
 
     print()
     print("="*60)
-    print(f"{timestamp} Basic system checks started.".center(60))
+    print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Basic system checks started.".center(60))
     print("="*60)
 
 
@@ -2137,7 +2136,7 @@ def intial_system_checks(is_log=False):
         log("Checking for any suspicious strings in rc files", is_log)
         for file in rc_files:
             if is_log:
-                sys.stdout.write(f"\033[1G{timestamp} Checking RC File - {file}\n")
+                sys.stdout.write(f"\033[1G{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')}  Checking RC File - {file}\n")
                 sys.stdout.flush()
 
             try:
@@ -2213,9 +2212,8 @@ def intial_system_checks(is_log=False):
 
     for pam_file in pam_files:
         if os.path.isfile(pam_file):
-            timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
             if is_log:
-                sys.stdout.write(f"\033[1G{timestamp} Checking PAM File - {pam_file}\n")
+                sys.stdout.write(f"\033[1G{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Checking PAM File - {pam_file}\n")
                 sys.stdout.flush()
                 time.sleep(0.002)
 
