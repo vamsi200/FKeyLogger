@@ -22,8 +22,26 @@ IMPORTANT:
 - Add log option to reasons for more verbose reasoning
 - Add log, explaining why a process is trusted
 - Add a initial setup flow, that get all the details about input devices etc..
-- Maintain a common logging and printing theme
+- IMP - Maintain a common logging and printing theme
 
 
 - Maybe in way future, implement sandboxing?
 
+
+#### NOT INTEGRATED FUNCTIONS/CLASSES YET TO THE MAIN FLOW ####
+- is_deleted_on_disk
+- is_upx_packed
+- check_obfuscated_or_packed_binaries
+- check_device_type
+- get_device_names_from_bpf_file
+- i_process_checks - fk is this?
+- check_impersonating_process
+- check_hidraw_connections
+- kill_process
+- is_suspicious_input_device
+- run_fileless_execution_loader
+- read_memfd_events
+- check_python_imports
+
+- Class ParentProcessValidator
+- Class ModuleChecker
