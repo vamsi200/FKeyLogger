@@ -251,7 +251,6 @@ class ParentProcessValidator:
             return False, None
 
 class BinaryAnalyzer:
-    #TODO: Will add the Hashing part later.. because the structure of the program is not yet set
     def is_trusted_binary(self, path):
         try:
             if not os.path.exists(path):
@@ -480,7 +479,7 @@ class FileMonitor:
                     if events:
                         return True  
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    print("[ERROR] Could not access process")
+                    print("[!] Could not access process")
                     return False
 
                 time.sleep(0.0)  # you remove, cpu boom
@@ -806,17 +805,17 @@ class NetworkMonitor:
                         if i.status == 'ESTABLISHED' and i.raddr and i.pid:
                             conn_count[i.pid] += 1
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    print("[ERROR] Failed to get the process details during scan")
+                    print("[!] Failed to get the process details during scan")
                     return False, None
                 time.sleep(1)
         except Exception as e:
-            print(f"[ERROR] Unexpected failure in network activity scan: {e}")
+            print(f"[!] Unexpected failure in network activity scan: {e}")
             return False, None
 
         try:
             conn = psutil.net_connections(kind='inet')
         except Exception:
-            print("[ERROR] Failed to get final connections")
+            print("[!] Failed to get final connections")
             return False, None
 
         for i in conn:
@@ -833,7 +832,7 @@ class NetworkMonitor:
                                     return True, ip
                                 return False, None
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            print("[ERROR] Failed to access process info")
+                            print("[!] Failed to access process info")
                             return False, None
 
         return False, None
@@ -911,9 +910,9 @@ class BPFMONITOR:
                     out_f.write(json.dumps(entry) + "\n")
 
         except FileNotFoundError:
-            print(f"[ERROR] File not found: {bpf_file}")
+            print(f"[!] File not found: {bpf_file}")
         except Exception as e:
-            print(f"[ERROR] {e}")
+            print(f"[!] {e}")
 
     def check_pid(self, pid):
         try:
@@ -947,7 +946,7 @@ class BPFMONITOR:
             except FileNotFoundError:
                 pass
             except Exception as e:
-                print(f"[ERROR] Failed to open file: {e}")
+                print(f"[!] Failed to open file: {e}")
             time.sleep(1)
         return False
 
@@ -1044,7 +1043,7 @@ def has_suspicious_strings(binary_path):
             if pattern.search(output):
                 return True, name.encode()
     except Exception as e:
-        print(f"[ERROR] Failed to scan {binary_path}: {e}")
+        print(f"[!] Failed to scan {binary_path}: {e}")
     return False, None
 
 def get_path(cwd, cmdline, exe_path):
@@ -1142,7 +1141,7 @@ def get_file_hash(path):
         return file_hash
     
     except Exception as e:
-        print(f"[ERROR] Failed to hash: {e}")
+        print(f"[!] Failed to hash: {e}")
         return False
 
 def hash_and_save(path, pid, name, score, ist: bool):
@@ -1183,7 +1182,7 @@ def hash_and_save(path, pid, name, score, ist: bool):
         return True
 
     except Exception as e:
-        print(f"[ERROR] Failed to hash and save: {e}")
+        print(f"[!] Failed to hash and save: {e}")
         return False
 
 def check_impersonating_process(pid):
@@ -1555,7 +1554,7 @@ def scan_process(is_log=False, target_pid=None):
                                 for reason in reason_list:
                                     reasons_by_pid[target_pid].add(reason)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
-                print(f"[ERROR] PID {target_pid} is not accessible.")
+                print(f"[!] PID {target_pid} is not accessible.")
                 return
         else:
             print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Trying to find KeyLogger(s)")
@@ -1918,7 +1917,7 @@ def phase_one_analysis(interval=5, is_log_enabled=False, scan_all=False):
                     else:
                         if p:
                             if not hash_and_save(p, pid, name, 0, True):
-                                print(f"[ERROR] Failed to update {file_path}")
+                                print(f"[!] Failed to update {file_path}")
             else:
                 output = r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe, fd, terminal, username, uptime)
 
@@ -1930,7 +1929,7 @@ def phase_one_analysis(interval=5, is_log_enabled=False, scan_all=False):
                 else:
                     if p:
                         if not hash_and_save(p, pid, name, 0, False):
-                            print(f"[ERROR] Failed to update {file_path}")
+                            print(f"[!] Failed to update {file_path}")
 
         print(f"\n{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Sleeping - {interval}s")
         time.sleep(interval)
@@ -2022,12 +2021,12 @@ def prompt_user_trust_a_process():
     binary_name = input("> Please Enter the binary path (example: /usr/bin/ls): ").strip()
 
     if not os.path.exists(binary_name):
-        print(f"[ERROR] The binary path '{binary_name}' does not exist.")
+        print(f"[!] The binary path '{binary_name}' does not exist.")
         return
 
     user_choice = input("> Do you want to trust this binary? (y/n): ").strip().lower()
     if user_choice not in ['y', 'n']:
-        print("[ERROR] Invalid input. Please enter 'y' or 'n'.")
+        print("[!] Invalid input. Please enter 'y' or 'n'.")
         return
 
     trust_flag = True if user_choice == 'y' else False
