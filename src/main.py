@@ -1,5 +1,4 @@
 import json
-from socket import timeout
 import psutil
 import os
 import ipaddress
@@ -1220,46 +1219,138 @@ def kill_process(pid):
 
 # idea is to find a suspicious input device based on heuristics, - will have to improve in future
 def is_suspicious_input_device():
+    sus_paths = {"/tmp", "/var/tmp", "/dev/shm"}
     context = pyudev.Context()
-    virtual_event_nodes = set()
+    suspicious_devices = []
+    now = time.time()
+
+    def is_owned_by_root(dev_node):
+        try:
+            stat_info = os.stat(dev_node)
+            return stat_info.st_uid == 0
+        except Exception:
+            return False
+
+    def get_process_info(pid):
+        try:
+            p = psutil.Process(int(pid))
+            exe = p.exe()
+            cmdline = " ".join(p.cmdline())
+            create_time = p.create_time()
+            exec_path_suspicious = any(exe.startswith(bp) for bp in sus_paths)
+            return {
+                "pid": pid,
+                "exe": exe,
+                "cmdline": cmdline,
+                "create_time": create_time,
+                "exec_path_suspicious": exec_path_suspicious
+            }
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+            return None
 
     for dev in context.list_devices(subsystem="input"):
         dev_node = dev.device_node or ""
         dev_path = dev.device_path or ""
 
-        if not dev.device_node or not dev.device_node.startswith("/dev/input/"):
+        if not dev_node.startswith("/dev/input/"):
             continue
 
         if not dev_path.startswith("/devices/virtual/input/"):
             continue
 
-        if dev.get("ID_INPUT_KEY") != "1" and dev.get("ID_INPUT") != "1":
+        if dev.get("POWER_SUPPLY_NAME") or dev.get("ID_PATH") == "platform-wmi":
             continue
 
-        if dev.device_type == "input" or dev.subsystem == "input":
+        if dev.get("ID_INPUT_KEY") != "1" and dev.get("ID_INPUT_MOUSE") != "1":
             continue
-        
-        if dev.get("POWER_SUPPLY_NAME") or dev.get("ID_PATH") == "platform-wmi":
+
+        vendor = dev.get("ID_VENDOR", "unknown")
+        model = dev.get("ID_MODEL", "unknown")
+        dev_name = dev.get("NAME", "").strip("\"")
+        bus = dev.get("ID_BUS", "unknown")
+
+        bus_virtual = (bus.lower() == "virtual")
+
+        try:
+            dev_stat = os.stat(dev_node)
+            device_age_sec = now - dev_stat.st_ctime
+        except Exception:
+            device_age_sec = None
+
+        accessing_processes = []
+        for pid in filter(str.isdigit, os.listdir("/proc")):
+            fd_dir = f"/proc/{pid}/fd"
+            if not os.path.isdir(fd_dir):
+                continue
+            try:
+                for fd in os.listdir(fd_dir):
+                    fd_path = os.path.join(fd_dir, fd)
+                    try:
+                        target = os.readlink(fd_path)
+                        if target == dev_node:
+                            pinfo = get_process_info(pid)
+                            if pinfo:
+                                accessing_processes.append(pinfo)
+                    except OSError:
+                        pass
+            except PermissionError:
                 continue
 
-        virtual_event_nodes.add(dev_node)
+        suspicious_procs = []
+        for proc in accessing_processes:
+            proc_age = now - proc["create_time"]
+            if proc["exec_path_suspicious"] or proc_age < 600:  # < 10 min, will think, whether to reduce it
+                suspicious_procs.append(proc)
 
-    for pid in filter(str.isdigit, os.listdir("/proc")):
-        fd_path = f"/proc/{pid}/fd"
-        if not os.path.isdir(fd_path):
-            continue
-        try:
-            for fd in os.listdir(fd_path):
-                try:
-                    target = os.readlink(os.path.join(fd_path, fd))
-                    if target in virtual_event_nodes:
-                        return (True, target)
-                except:
-                    continue
-        except:
-            continue
+        suspicious_reasons = []
+        if bus_virtual:
+            suspicious_reasons.append("Bus type is virtual")
+        if name_blacklisted := (dev_name in {"Test Virtual Keyboard", "VirtualBox USB Tablet", "VMware Virtual USB Keyboard"}):
+            suspicious_reasons.append(f"Device name '{dev_name}' is blacklisted")
+        if device_age_sec is not None and device_age_sec < 60:
+            suspicious_reasons.append("Device created less than 1 minute ago")
+        if not is_owned_by_root(dev_node):
+            suspicious_reasons.append("Device not owned by root user")
 
-    return False
+        if suspicious_procs:
+            suspicious_reasons.append(
+                "Accessed by suspicious process(es): " +
+                ", ".join(f"{proc['exe']} (PID {proc['pid']})" for proc in suspicious_procs)
+            )
+        elif accessing_processes:
+            suspicious_reasons.append(
+                "Accessed by process(es): " +
+                ", ".join(f"{proc['exe']} (PID {proc['pid']})" for proc in accessing_processes)
+            )
+        else:
+            suspicious_reasons.append("No process currently accessing device")
+
+        is_suspicious = (
+            bus_virtual or
+            name_blacklisted or
+            (device_age_sec is not None and device_age_sec < 60) or
+            len(suspicious_procs) > 0 or
+            not is_owned_by_root(dev_node)
+        )
+
+        if is_suspicious:
+            suspicious_devices.append({
+                "device_node": dev_node,
+                "device_name": dev_name,
+                "vendor": vendor,
+                "model": model,
+                "bus": bus,
+                "device_age_sec": device_age_sec,
+                "owned_by_root": is_owned_by_root(dev_node),
+                "accessing_processes": accessing_processes,
+                "suspicious_processes": suspicious_procs,
+                "reasons": suspicious_reasons
+            })
+
+    if suspicious_devices:
+        return True, suspicious_devices
+    else:
+        return False, None
 
 
 
@@ -1469,13 +1560,15 @@ def bpf_monitor_with_something(bpf):
     code = ''.join(choices(string.ascii_uppercase + string.digits, k=5))
     print(f"Type this code for more accurate results (or press Enter to skip): {code}")
 
-    bpf.start(is_log_enabled=True)
+    bpf.start()
     
     user_input = input("> ").strip()
 
     if not user_input:
         return False
     elif user_input == code:
+        return True
+    elif user_input !=code:
         return True
     else:
         return False
@@ -1567,10 +1660,11 @@ def scan_process(is_log=False, target_pid=None):
 
                     if target_pid in input_access_pids:
                         suspicious_candidates.add(target_pid)
-                        reasons_by_pid[target_pid].add("Accessing Input Devices")
+                        reasons_by_pid[target_pid].add("Has direct input access")
                         if target_pid is not None and bpf.check_pid(target_pid):
                             reasons_by_pid[target_pid].add("Accessing Input Devices confirmed using - BPF")
-                            print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID - {target_pid}")
+                            if target_pid is not None:
+                                print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID - {target_pid}")
 
                     if path:
                         fullpaths[target_pid] = path
@@ -1600,18 +1694,18 @@ def scan_process(is_log=False, target_pid=None):
                         suspicious_candidates.add(p.pid)
                         reasons_by_pid[p.pid].add("Has input access through X11")
                         log(f"X11 access activity detected for PID {p.pid}", is_log)
+                    if bpf.check_pid(p.pid):
+                            reasons_by_pid[p.pid].add("Accessing Input Devices confirmed using - BPF")
+                            print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID {p.pid}")
                     parent_map[p.pid] = p.ppid()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     log(f"Skipped PID {p.pid} (process not accessible)", is_log)
                     continue
-
+            
             for pid in input_access_pids:
                 suspicious_candidates.add(pid)
                 reasons_by_pid[pid].add("Has direct input access")
-                if bpf.check_pid(pid):
-                    reasons_by_pid[pid].add("BPF activity")
-                    print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID {target_pid}")
-
+           
             for pid in suspicious_candidates:
                 try:
                     proc = psutil.Process(pid)
@@ -2102,6 +2196,7 @@ def intial_system_checks(is_log=False):
     print("└" + "─" * 58 + "┘")
 
     checks = [
+        "Find any suspicious input device based on heuristics",
         "Inspect user shell configuration (rc files) for suspicious patterns",
         "Analyze PAM authentication modules for credential logging risks",
         "Scan for suspicious shell command aliases",
@@ -2127,6 +2222,46 @@ def intial_system_checks(is_log=False):
     print("="*60)
     print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Basic system checks started.".center(60))
     print("="*60)
+    
+    s_input_device, output = is_suspicious_input_device()
+    
+    if s_input_device:
+        print("\033[1;31mSuspicious Input Device\033[0m .................... \033[1;31mWARNING\033[0m\n")
+        
+        if output:
+            for i, dev in enumerate(output, 1):
+                print(f"  ┌─ Device [{i}]: \033[1;37m{dev['device_node']} ({dev['device_name']})\033[0m")
+                print(f"  │")
+                print(f"  ├─ Vendor: {dev['vendor']}")
+                print(f"  ├─ Model : {dev['model']}")
+                print(f"  ├─ Bus   : {dev['bus']}")
+
+                device_age = dev['device_age_sec']
+                age_str = f"{device_age:.0f} seconds" if device_age is not None else "unknown"
+                print(f"  ├─ Device age: {age_str}")
+
+                print(f"  ├─ Owned by root: {'Yes' if dev['owned_by_root'] else 'No'}")
+
+                print(f"  ├─ Reasons:")
+                for reason in dev['reasons']:
+                    print(f"  │    - {reason}")
+
+                print(f"  ├─ Accessing process(es):")
+                if dev['accessing_processes']:
+                    for j, proc in enumerate(dev['accessing_processes']):
+                        is_last_proc = (j == len(dev['accessing_processes']) - 1)
+                        connector = "└─" if is_last_proc else "├─"
+                        proc_age_min = (time.time() - proc.get('create_time', 0)) / 60
+                        print(f"  │    {connector} {proc['exe']} (PID {proc['pid']}, Age: {proc_age_min:.1f} min)")
+                else:
+                    print(f"  │    No processes currently accessing this device")
+
+                print(f"  │")
+                print(f"  └─ \033[2mReview this input device - it exhibits suspicious traits and/or is accessed by suspicious processes.\033[0m\n")
+
+    else:
+        print("\033[1;32mSuspicious Input Device\033[0m .................... \033[1;32mOK\033[0m")
+
 
 
     history_patterns = [
@@ -2544,6 +2679,8 @@ def intial_system_checks(is_log=False):
         print("  │")
         print("  └─ \033[2mUse -p PID for detailed analysis\033[0m")
         print()
+
+
 
 
 def log(msg, is_log_enabled):
