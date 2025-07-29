@@ -1,4 +1,5 @@
 import json
+from socket import timeout
 import psutil
 import os
 import ipaddress
@@ -376,7 +377,7 @@ class BinaryAnalyzer:
                     reasons.append("upx-packed")
 
                 if has_suspicious_modules(full_path, libs):
-                    reasons.append("suspicious-strings")
+                    reasons.append("suspicious-modules")
 
                 if self.is_deleted_on_disk(p_info['pid']):
                         reasons.append("memory-deleted")
@@ -841,23 +842,38 @@ bpf_file = "bpf_output.json"
 or_file = "test.json"
 
 class BPFMONITOR:
-    def __init__(self):
-        self.proc = None
-        atexit.register(self.stop)
+    def __init__(self, bpf_file, timeout=5):
+            self.proc = None
+            self.timeout = timeout
+            self.bpf_file = bpf_file
+            atexit.register(self.stop)
 
-    def start(self, timeout, is_log_enabled=False):
-        if is_log_enabled:
-            print(" Trying to capture processes using input devices with - BPF")
-        open(bpf_file, "w").close()
-        self.proc = subprocess.Popen(
-            ['sudo', './loader'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        time.sleep(timeout)
+    def start(self):
+        if not os.path.exists('./loader'):
+            print("Error: ./loader binary not found in current directory!")
+            return
+        
+        if not os.access('./loader', os.X_OK):
+            print("Error: ./loader is not executable!")
+            return
+        
+        open(self.bpf_file, "w").close()
+        
+        try:
+            self.proc = subprocess.Popen(
+                ['sudo', './loader'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            self._timer = threading.Timer(self.timeout, self.stop)
+            self._timer.daemon = True
+            self._timer.start()
+            
+        except Exception as e:
+            print(f"Failed to start BPF binary: {e}")
 
     def stop(self):
-        if self.proc:
+        if self.proc and self.proc.poll() is None:
             try:
                 self.proc.terminate()
                 self.proc.wait(timeout=5)
@@ -920,7 +936,7 @@ class BPFMONITOR:
                 for line in f:
                     try:
                         entry = json.loads(line)
-                        if str(pid) == entry.get("pid") and entry.get("pid") != str(CURRENT_PID):
+                        if pid == entry.get("pid") and entry.get("pid") != str(CURRENT_PID):
                             return True
                     except Exception as e:
                         print(f"{e}")
@@ -1007,25 +1023,26 @@ def has_suspicious_modules(binary, lib):
 
 
 def has_suspicious_strings(binary_path):
-    sus_patterns = [
-        r"/dev/input/event\d*",
+    path_patterns = [
+        r"/dev/input/event\d+",
+        r"libx11\.so",
+        r"libxtst\.so",
+        r"keyboard\.h",
+    ]
+    word_patterns = [
         r"xopendisplay",
         r"xquerykeymap",
         r"xrecordcreatecontext",
         r"keylogger",
         r"keystroke",
         r"grab_keyboard",
-        r"libx11\.so",
-        r"libxtst\.so",
         r"raw_input",
         r"input_event",
         r"keypress",
-        r"keyboard\.h",
         r"log_keys",
         r"sendinput",
         r"recordkey",
         r"input_log",
-        r"keylogger",
         r"keyboard_read",
         r"hook_keyboard",
     ]
@@ -1038,10 +1055,15 @@ def has_suspicious_strings(binary_path):
             timeout=5
         ).lower()
 
-        for name in sus_patterns:
-            pattern = re.compile(r'\b' + re.escape(name.lower()) + r'\b')
-            if pattern.search(output):
-                return True, name.encode()
+        for pattern in path_patterns:
+            if re.search(pattern, output):
+                return True, pattern.encode()
+
+        for word in word_patterns:
+            pattern = r'\b' + word + r'\b'
+            if re.search(pattern, output):
+                return True, word.encode()
+
     except Exception as e:
         print(f"[!] Failed to scan {binary_path}: {e}")
     return False, None
@@ -1082,51 +1104,6 @@ known_safe_programs = {
     "/usr/bin/Xorg", "/usr/bin/Xwayland"
 }
 
-
-# reviewed_paths = {}
-# def prompt_user(name, path, pid, usage):
-#     if path in reviewed_paths:
-#         return reviewed_paths[path]    
-#
-#     print("\nProcess")
-#     print(f"PID     : {pid}")
-#     print(f"Name    : {name}")
-#     print(f"Path    : {path}")
-#     print(f"Using   : {usage}\n")
-#
-#     print("This process is using keyboard input. Do you want to analyze it furture?")
-#     print("[1] Yes (Check for suspicious behaviour)")
-#     print("[2] No ((Mark this process as legitimate/trusted))")
-#
-#     while True:
-#         choice = input("> ").strip()
-#         if choice == '1':
-#             reviewed_paths[path] = False
-#             return False
-#         elif choice == '2':
-#             print("Marked as trusted.\n")
-#             reviewed_paths[path] = True
-#             return True
-#         else:
-#             print("Invalid choice. Please enter 1, 2, or 3.")
-
-def i_process_checks(pid):
-    found_pids = defaultdict(set)
-    i = InputMonitor()
-    x11 = X11Analyzer()
-    event_map = i.get_process_using_input_device()
-    for input_pid, events in event_map.items():
-        for event in events:
-            found_pids[input_pid].add(event)
-
-    x11_confidence, _ = x11.check_x11_connection(pid)
-    if x11_confidence >= 3:
-        found_pids[pid].add("x11")
-
-    if pid in found_pids:
-        return True, list(found_pids[pid])
-
-    return False, None
 
 def get_file_hash(path):
     try:
@@ -1405,7 +1382,11 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
         if bi.is_upx_packed(full_path) or bi.is_deleted_on_disk(pid):
             sus_score += 1
             reasons.append("binary is upx packed")
-        
+
+        if bi.is_deleted_on_disk(pid):
+            sus_score += 1
+            reasons.append("binary is deleted on disk")
+
         # cron_job_score = pc.check_cron_jobs()
         # if cron_job_score >= 2:
         #     sus_score += 2
@@ -1479,11 +1460,32 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
 # check suspicious strings in a binary
 # check file activity - writing or reading a file
 # check active connections to a private ip address
+
+from random import choices
+import string
+import threading
+
+def bpf_monitor_with_something(bpf):
+    code = ''.join(choices(string.ascii_uppercase + string.digits, k=5))
+    print(f"Type this code for more accurate results (or press Enter to skip): {code}")
+
+    bpf.start(is_log_enabled=True)
+    
+    user_input = input("> ").strip()
+
+    if not user_input:
+        return False
+    elif user_input == code:
+        return True
+    else:
+        return False
+
+
 def scan_process(is_log=False, target_pid=None):
     log("Initializing analyzers", is_log)
     i = InputMonitor()
     input_access_pids = i.get_process_using_input_device()
-    bpf = BPFMONITOR()
+    bpf = BPFMONITOR(bpf_file, 5)
     x = X11Analyzer()
     ba = BinaryAnalyzer()
     fm = FileMonitor()
@@ -1492,11 +1494,38 @@ def scan_process(is_log=False, target_pid=None):
     nm = NetworkMonitor()
 
     print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning Started.")
+    print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Getting Process details.")
+    try:
+        p = psutil.Process(target_pid)
+        path = get_path(p.cwd(), p.cmdline(), p.exe())
+
+        details = [
+            f"PID  : {p.pid}",
+            f"Name : {p.name()}",
+            f"Path : {path}",
+        ]
+        maxlen = max(len(line) for line in details)
+        border = "+" + "-"*(maxlen+2) + "+"
+
+        print("\nProcess Details")
+        print(border)
+        for line in details:
+            print(f"| {line.ljust(maxlen)} |")
+            print(border)
+        print()
+
+    except psutil.NoSuchProcess as e:
+        print(f"{e}")
 
     log("Starting monitoring using BPF for 5 seconds", is_log)
-    bpf.start(5)
-    bpf.stop()
+    captcha_result = bpf_monitor_with_something(bpf)
+
+    if not captcha_result:
+        bpf.start()
+        time.sleep(bpf.timeout)
+
     log("BPF monitoring stopped.", is_log)
+
 
     sockets, _ = ipc.detect_suspicious_ipc_channels()
     log(f"Detected {len(sockets)} suspicious IPC socket(s).", is_log)
@@ -1510,8 +1539,8 @@ def scan_process(is_log=False, target_pid=None):
     print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Found {len(input_access_pids)} PID's accessing /dev/input.")
 
     if input_access_pids and is_log:
-        for input, _ in input_access_pids.items():
-            print(f"    •  {input}", is_log)
+        for input_pids, _ in input_access_pids.items():
+            print(f"    •  {input_pids}", is_log)
 
     fullpaths = {}
     parent_map = {}
@@ -1526,33 +1555,39 @@ def scan_process(is_log=False, target_pid=None):
             try:
                 print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning PID - {target_pid}")
                 p = psutil.Process(target_pid)
-                confidence, access_rate = x.check_x11_connection(target_pid)
-                if confidence >= 3 and access_rate > 0:
-                    suspicious_candidates.add(target_pid)
-                    reasons_by_pid[target_pid].add("Has input access through X11")
-                    log(f"X11 access activity detected for PID {target_pid} (confidence: {confidence}, rate: {access_rate})", is_log)
-                parent_map[target_pid] = p.ppid()
-
-                if target_pid in input_access_pids:
-                    suspicious_candidates.add(target_pid)
-                    reasons_by_pid[target_pid].add("Accessing Input Devices")
-                    if target_pid is not None and bpf.check_pid(target_pid):
-                        reasons_by_pid[target_pid].add("Accessing Input Devices confirmed using - BPF")
-                        print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID - {target_pid}")
-
                 path = get_path(p.cwd(), p.cmdline(), p.exe())
-                if path:
-                    fullpaths[target_pid] = path
-                    if sockets:
-                        for file in sockets:
-                            result, reason_list = ba.check_file_authenticity(file, path, target_pid)
-                            if not result:
-                                trusted_paths.add(path)
-                            else:
-                                unrecognized_paths.add(path)
-                                suspicious_pids.add(target_pid)
-                                for reason in reason_list:
-                                    reasons_by_pid[target_pid].add(reason)
+                choice = input("> Proceed furthur? (y/n): ").strip()
+                if choice == 'Y' or choice == 'y':
+                    confidence, access_rate = x.check_x11_connection(target_pid)
+                    if confidence >= 3 and access_rate > 0:
+                        suspicious_candidates.add(target_pid)
+                        reasons_by_pid[target_pid].add("Has input access through X11")
+                        log(f"X11 access activity detected for PID {target_pid} (confidence: {confidence}, rate: {access_rate})", is_log)
+                    parent_map[target_pid] = p.ppid()
+
+                    if target_pid in input_access_pids:
+                        suspicious_candidates.add(target_pid)
+                        reasons_by_pid[target_pid].add("Accessing Input Devices")
+                        if target_pid is not None and bpf.check_pid(target_pid):
+                            reasons_by_pid[target_pid].add("Accessing Input Devices confirmed using - BPF")
+                            print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID - {target_pid}")
+
+                    if path:
+                        fullpaths[target_pid] = path
+                        if sockets:
+                            for file in sockets:
+                                result, reason_list = ba.check_file_authenticity(file, path, target_pid)
+                                if not result:
+                                    trusted_paths.add(path)
+                                else:
+                                    unrecognized_paths.add(path)
+                                    suspicious_pids.add(target_pid)
+                                    for reason in reason_list:
+                                        reasons_by_pid[target_pid].add(reason)
+                else:
+                    print("[*] Exiting..")
+                    exit(0)
+
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 print(f"[!] PID {target_pid} is not accessible.")
                 return
@@ -1876,8 +1911,8 @@ def phase_one_analysis(interval=5, is_log_enabled=False, scan_all=False):
         input_access_pids = i.get_process_using_input_device()
         sus_libraries = load_sus_libraries()
         parent_map = {}
-        bpf = BPFMONITOR()
-        bpf.start(5)
+        bpf = BPFMONITOR(bpf_file, 5)
+        bpf.start()
         bpf.stop()
         path_check = set()
         for index, proc in enumerate(psutil.process_iter(['pid', 'cmdline', 'exe', 'cwd'])):
@@ -1941,7 +1976,7 @@ def change_and_join(reasons):
 
 def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log_enabled=False):
 
-    bpf = BPFMONITOR()
+    bpf = BPFMONITOR(bpf_file, 5)
     x = X11Analyzer()
     ba = BinaryAnalyzer()
     fm = FileMonitor()
@@ -2573,5 +2608,5 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
     else:
-            intial_system_checks(args.log)
+        intial_system_checks(args.log)
 
