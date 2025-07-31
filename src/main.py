@@ -21,7 +21,7 @@ from datetime import datetime
 import re
 import collections
 import itertools
-
+import math
 file_path = "process.json"
 white_list_ports = [8080, 443, 22]
 current_user = os.getlogin()
@@ -286,6 +286,43 @@ class BinaryAnalyzer:
         except Exception:
             return False
 
+    def check_file_entropy(self, file_path):
+        try:
+            with open(file_path, 'rb') as f:
+                byte_arr = f.read()
+            if not byte_arr:
+                return 0
+
+            freq_list = [0] * 256
+            for b in byte_arr:
+                freq_list[b] += 1
+            entropy = 0
+            for freq in freq_list:
+                if freq > 0:
+                    p = freq / len(byte_arr)
+                    entropy -= p * math.log2(p)
+            return entropy
+        except Exception:
+            return 0
+
+    def check_packer_magic_bytes(self, path):
+        packer_signatures = {
+            b'UPX!': "UPX",
+            b'MPRESS': "MPRESS",
+            b'ASPACK': "ASPack",
+            b'PECompact': "PECompact"
+        }
+        try:
+            with open(path, 'rb') as f:
+                header = f.read(1024)
+            for sig, name in packer_signatures.items():
+                if sig in header:
+                    return True, name
+            return False, None
+        except Exception:
+            return False, None
+
+
     def check_file_authenticity(self, file_path, full_path, pid=None):
         suspicious_dirs = ["/tmp", "/dev/shm", "/var/tmp", "/run", "/home"]
         reasons = []
@@ -310,7 +347,7 @@ class BinaryAnalyzer:
                 if any(full_path.startswith(d) for d in suspicious_dirs):
                     reasons.append(f"Executable in suspicious directory: {full_path}")
                     return True
-
+                
                 if full_path.startswith(("/usr", "/bin", "/sbin")) and st.st_uid != 0:
                     reasons.append(f"System binary not owned by root: {full_path}")
                     return True
@@ -336,11 +373,10 @@ class BinaryAnalyzer:
                     return True, reasons
 
         return False, []
-    #FIX: This is not good, I have to research more on this..
+
+    # Running entropy checks on all the processes would be a cpu intensive task and too time consuming.. so for now, added only for -p option
     def check_obfuscated_or_packed_binaries(self, pid=None):
-        flagged = []
         seen_paths = set()
-        libs = load_sus_libraries()
 
         processes = [psutil.Process(pid)] if pid else psutil.process_iter(['pid', 'name', 'cwd', 'exe', 'cmdline'])
 
@@ -373,27 +409,27 @@ class BinaryAnalyzer:
                 reasons = []
 
                 if self.is_upx_packed(full_path):
-                    reasons.append("upx-packed")
-
-                if has_suspicious_modules(full_path, libs):
-                    reasons.append("suspicious-modules")
+                    reasons.append("is upx-packed")
 
                 if self.is_deleted_on_disk(p_info['pid']):
-                        reasons.append("memory-deleted")
+                        reasons.append("is memory-deleted")
+
+                rt, name = self.check_packer_magic_bytes(full_path)
+                if rt:
+                        reasons.append(f"has packer-signature {name}")
+
+                entropy = self.check_file_entropy(full_path)
+                if entropy > 7.5:
+                    reasons.append("has high-entropy")
 
                 if reasons:
                     seen_paths.add(full_path)
-                    flagged.append({
-                        "pid": p_info['pid'],
-                        "name": p_info['name'],
-                        "path": full_path,
-                        "reasons": reasons
-                    })
+                       
 
             except (psutil.NoSuchProcess, psutil.AccessDenied, FileNotFoundError):
                 continue
 
-            return json.dumps(flagged, indent=2) if flagged else json.dumps(False)
+            return reasons if reasons else False
 
 class IPCScanner:
     def detect_suspicious_ipc_channels(self, ignorable_files=None):
@@ -1558,7 +1594,7 @@ import threading
 
 def bpf_monitor_with_something(bpf):
     code = ''.join(choices(string.ascii_uppercase + string.digits, k=5))
-    print(f"Type this code for more accurate results (or press Enter to skip): {code}")
+    print(f"\nType this code for more accurate results (or press Enter to skip): {code}")
 
     bpf.start()
     
@@ -1658,6 +1694,14 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 choice = input("> Proceed furthur? (y/n): ").strip()
                 if choice == 'Y' or choice == 'y':
                     confidence, access_rate = x.check_x11_connection(target_pid)
+                    o_reasons = ba.check_obfuscated_or_packed_binaries(target_pid)
+
+                    if o_reasons:
+                        suspicious_candidates.add(target_pid)
+                        for reason in o_reasons:
+                            reasons_by_pid[target_pid].add(reason)
+                            log(f"PID - {target_pid} {reason}", is_log)
+
                     if confidence >= 3 and access_rate > 0:
                         suspicious_candidates.add(target_pid)
                         reasons_by_pid[target_pid].add("Has input access through X11")
@@ -2766,5 +2810,7 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
     else:
-        intial_system_checks(args.log)
+        # intial_system_checks(args.log)
+        output = m.check_obfuscated_or_packed_binaries()
+        print(output)
 
