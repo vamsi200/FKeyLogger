@@ -962,6 +962,19 @@ class BPFMONITOR:
                 for entry in updated_entries:
                     out_f.write(json.dumps(entry) + "\n")
 
+            data = set()
+            with open(or_file, "r") as f:
+                lines = f.readlines()
+                for line in lines:
+                    entry = json.loads(line)
+                    p = entry.get("pid")
+                    device_name = entry.get("device_path")
+                    if p and device_name:
+                        data.add((p, device_name))
+                    else:
+                        continue
+                return data
+
         except FileNotFoundError:
             print(f"[!] File not found: {bpf_file}")
         except Exception as e:
@@ -1625,19 +1638,24 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
 
 
     sockets, _ = ipc.detect_suspicious_ipc_channels()
-    log(f"Detected {len(sockets)} suspicious IPC socket(s).", is_log)
+    log(f"Detected {len(sockets)} suspicious IPC socket(s):", is_log)
     
-    if is_log:
-        for sock in sockets:
-            print(f"    • {sock}")
+    for sock in sockets:
+        log(f"{sock}", is_log)
 
-    log(f"PID's accessing /dev/input/ ", is_log)
+    out = k.get_device_names_from_bpf_file()
+    print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} PIDs accessing input devices (keyboard/event) and terminals (pts):")
+
+    if out:
+        for p, d in sorted(out):
+            log(f"PID {p} -> {d}", is_log)
     
-    print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Found {len(input_access_pids)} PID's accessing /dev/input.")
 
     if input_access_pids and is_log:
-        for input_pids, _ in input_access_pids.items():
-            print(f"    •  {input_pids}", is_log)
+        for input_pid in input_access_pids:
+               log(f"PID {input_pid} -> /dev/input/*", is_log)
+    
+
 
     fullpaths = {}
     parent_map = {}
@@ -1791,8 +1809,9 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
             #         suspicious_candidates.add(m_pid)
             #         reasons_by_pid[m_pid].add("Running directly From Memory")
             #         log(f"Running directly from memory with PID {m_pid}", is_log)
-
-        log(f"Reporting phase started for suspicious PID's {suspicious_pids}", is_log)
+        
+        for sp in suspicious_pids:
+            log(f"Reporting phase started for suspicious PID's {sp}", is_log)
         
         if target_pid:
             check_and_report(fullpaths, trusted_paths, unrecognized_paths,
@@ -2770,7 +2789,7 @@ if __name__ == "__main__":
     require_root()
     args = parse_args()
     m = BinaryAnalyzer()
-
+    k = BPFMONITOR(bpf_file)
     banner = r"""
     ▄████████    ▄█   ▄█▄    ▄████████ ▄██   ▄    ▄█        ▄██████▄     ▄██████▄     ▄██████▄     ▄████████    ▄████████      
     ███    ███   ███ ▄███▀   ███    ███ ███   ██▄ ███       ███    ███   ███    ███   ███    ███   ███    ███   ███    ███      
@@ -2807,7 +2826,8 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
     else:
-        # intial_system_checks(args.log)
-        mem_pids = read_memfd_events()
+        intial_system_checks(args.log)
+        # out = k.get_device_names_from_bpf_file()
+        # # mem_pids = read_memfd_events()
      
 
