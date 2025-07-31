@@ -1574,7 +1574,7 @@ def bpf_monitor_with_something(bpf):
         return False
 
 
-def scan_process(is_log=False, target_pid=None):
+def scan_process(is_log=False, target_pid=None, scan_all=False):
     log("Initializing analyzers", is_log)
     i = InputMonitor()
     input_access_pids = i.get_process_using_input_device()
@@ -1588,27 +1588,11 @@ def scan_process(is_log=False, target_pid=None):
 
     print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning Started.")
     print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Getting Process details.")
-    try:
-        p = psutil.Process(target_pid)
-        path = get_path(p.cwd(), p.cmdline(), p.exe())
 
-        details = [
-            f"PID  : {p.pid}",
-            f"Name : {p.name()}",
-            f"Path : {path}",
-        ]
-        maxlen = max(len(line) for line in details)
-        border = "+" + "-"*(maxlen+2) + "+"
-
-        print("\nProcess Details")
-        print(border)
-        for line in details:
-            print(f"| {line.ljust(maxlen)} |")
-            print(border)
-        print()
-
-    except psutil.NoSuchProcess as e:
-        print(f"{e}")
+    if scan_all:
+        print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning all processes, including those marked as trusted.")
+    else:
+        print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Skipping processes trusted by program heuristics or user configuration.")
 
     log("Starting monitoring using BPF for 5 seconds", is_log)
     captcha_result = bpf_monitor_with_something(bpf)
@@ -1647,6 +1631,28 @@ def scan_process(is_log=False, target_pid=None):
         if target_pid is not None:
             try:
                 print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning PID - {target_pid}")
+                try:
+                    p = psutil.Process(target_pid)
+                    path = get_path(p.cwd(), p.cmdline(), p.exe())
+
+                    details = [
+                        f"PID  : {p.pid}",
+                        f"Name : {p.name()}",
+                        f"Path : {path}",
+                    ]
+                    maxlen = max(len(line) for line in details)
+                    border = "+" + "-"*(maxlen+2) + "+"
+
+                    print("\nProcess Details")
+                    print(border)
+                    for line in details:
+                        print(f"| {line.ljust(maxlen)} |")
+                        print(border)
+                    print()
+
+                except psutil.NoSuchProcess as e:
+                    print(f"{e}")
+
                 p = psutil.Process(target_pid)
                 path = get_path(p.cwd(), p.cmdline(), p.exe())
                 choice = input("> Proceed furthur? (y/n): ").strip()
@@ -1689,18 +1695,40 @@ def scan_process(is_log=False, target_pid=None):
             print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Trying to find KeyLogger(s)")
             for p in psutil.process_iter(['pid', 'ppid']):
                 try:
+                    cwd = p.cwd()
+                    cmdline = p.cmdline()
+                    exe = p.exe()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        log(f"Skipped PID {p.pid} (could not access CWD/cmdline/exe)", is_log)
+                        continue
+
+                path = get_path(cwd, cmdline, exe)
+                if path:
+                    if skip_current_pid(path, p.pid):
+                        continue
+                try:
+                    if not scan_all:
+                        if path:
+                            file_hash = get_file_hash(path)
+                            if pid_is_trusted(p.pid, file_hash):
+                                continue
+
                     confidence, access_rate = x.check_x11_connection(p.pid)
                     if confidence >= 3 and access_rate > 0:
                         suspicious_candidates.add(p.pid)
                         reasons_by_pid[p.pid].add("Has input access through X11")
                         log(f"X11 access activity detected for PID {p.pid}", is_log)
+
                     if bpf.check_pid(p.pid):
-                            reasons_by_pid[p.pid].add("Accessing Input Devices confirmed using - BPF")
-                            print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID {p.pid}")
+                        reasons_by_pid[p.pid].add("Accessing Input Devices confirmed using - BPF")
+                        print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID {p.pid}")
+
                     parent_map[p.pid] = p.ppid()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     log(f"Skipped PID {p.pid} (process not accessible)", is_log)
                     continue
+
             
             for pid in input_access_pids:
                 suspicious_candidates.add(pid)
@@ -1994,11 +2022,10 @@ def phase_one_analysis(interval=5, is_log_enabled=False, scan_all=False):
     print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scan interval - {interval}s")
     print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Monitoring processes for suspicious activity.")
 
-    if is_log_enabled:
-         if scan_all:
-             print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning all processes, including those marked as trusted.")
-         else:
-             print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Skipping processes trusted by program heuristics or user configuration.")
+    if scan_all:
+        print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning all processes, including those marked as trusted.")
+    else:
+        print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Skipping processes trusted by program heuristics or user configuration.")
 
     while True:
         i = InputMonitor()
@@ -2035,19 +2062,13 @@ def phase_one_analysis(interval=5, is_log_enabled=False, scan_all=False):
             #TODO: have to think about whether to skip the processes that are already processed? 
             if not scan_all:
                 file_hash = get_file_hash(p)
-                if not pid_is_trusted(pid, file_hash):
-                    output = r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe, fd, terminal, username, uptime)
-
-                    if output and pid:
-                        _, path, _, reasons = output
-                        if path not in path_check:
-                            path_check.add(path)
-                            phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log_enabled)
-                    else:
-                        if p:
-                            if not hash_and_save(p, pid, name, 0, True):
-                                print(f"[!] Failed to update {file_path}")
+                proceed = not pid_is_trusted(pid, file_hash)
+                hash_flag = True
             else:
+                proceed = True
+                hash_flag = False
+
+            if proceed:
                 output = r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe, fd, terminal, username, uptime)
 
                 if output and pid:
@@ -2057,7 +2078,7 @@ def phase_one_analysis(interval=5, is_log_enabled=False, scan_all=False):
                         phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log_enabled)
                 else:
                     if p:
-                        if not hash_and_save(p, pid, name, 0, False):
+                        if not hash_and_save(p, pid, name, 0, hash_flag):
                             print(f"[!] Failed to update {file_path}")
 
         print(f"\n{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Sleeping - {interval}s")
@@ -2725,7 +2746,7 @@ if __name__ == "__main__":
 
     if args.scan:
         try:
-            scan_process(args.log)
+            scan_process(args.log, None, args.all)
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
     elif args.monitor:
@@ -2735,7 +2756,7 @@ if __name__ == "__main__":
             print("\n[*] Scan interrupted by user. Exiting...")
     elif args.p:
         try:
-            scan_process(args.log, args.p)
+            scan_process(args.log, args.p, args.all)
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
 
