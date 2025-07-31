@@ -737,10 +737,12 @@ class PersistenceChecker:
                             if script_path.startswith('./'):
                                 abs_path = os.path.abspath(os.path.join(os.path.dirname(file), script_path))
                             if os.path.exists(abs_path) and os.path.isfile(abs_path):
-                                libs, weight = has_suspicious_modules(abs_path, load_sus_libraries())
-                                if libs and weight > 2:
-                                    suspicious_signals.append(f"script:{abs_path}")
-                                    script_sus.append((abs_path, libs))
+                                h_output = has_suspicious_modules(abs_path, load_sus_libraries())
+                                if h_output:
+                                    for libs, _ in h_output.items():
+                                        if libs:
+                                            suspicious_signals.append(f"script:{abs_path}")
+                                            script_sus.append((abs_path, libs))
                         if suspicious_signals and script_sus:
                             entry = {
                                 "file": file,
@@ -1023,38 +1025,51 @@ def get_binary_info(full_path):
         return False
 
 
-def has_suspicious_modules(binary, lib):
-    def lines():
-        try:
-            if binary.endswith(('.py', '.sh', '.pl')):
-                with open(binary, 'r', encoding='utf-8', errors='ignore') as f:
-                    for line in f:
-                        yield line.lower()
-            else:
-                output = subprocess.check_output(
-                    ["strings", binary],
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    timeout=2
-                )
-                for line in output.splitlines():
-                    yield line.lower()
-        except Exception:
-            return
 
+def has_suspicious_modules(binary, lib_scores):
     try:
+        def lines():
+            try:
+                if binary.endswith(('.py', '.sh', '.pl')):
+                    with open(binary, 'r', encoding='utf-8', errors='ignore') as f:
+                        for line in f:
+                            yield line.lower()
+                else:
+                    output = subprocess.check_output(
+                        ["strings", binary],
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                        timeout=2
+                    )
+                    for line in output.splitlines():
+                        yield line.lower()
+            except Exception:
+                return
+
         patterns = {
-            lib_name: re.compile(r'\b' + re.escape(lib_name) + r'\b')
-            for lib_name in lib.keys()
+            lib_name: re.compile(r'\b' + re.escape(lib_name.lower()) + r'\b')
+            for lib_name in lib_scores
         }
+
+        found_libs = {}
+        found_keylogger = False
 
         for line in lines():
             for lib_name, pattern in patterns.items():
-                if pattern.search(line):
-                    return lib_name, lib[lib_name]
-        return None, 0
+                if lib_name not in found_libs and pattern.search(line):
+                    score = lib_scores[lib_name]
+                    found_libs[lib_name] = score
+                    if score >= 4:
+                        found_keylogger = True
+
+        if found_keylogger:
+            return found_libs
+
+        return None
+
     except Exception:
-        return None, 0
+        return None
+
 
 
 def has_suspicious_strings(binary_path):
@@ -1393,7 +1408,7 @@ def is_suspicious_input_device():
 # TODO: theory is that a malicious file could run in memory without writing to disk
 # we could monitor them using bpf, initial idea is to capture these - memfd_create, execveat
 memfd_out_file = "memfd_create_output.json"
-def run_fileless_execution_loader(timeout=50, binary="./fe_loader", out_file=memfd_out_file):
+def run_fileless_execution_loader(timeout=10, binary="./fe_loader", out_file="memfd_create_output.json"):
     open(out_file, "w").close()
 
     p = subprocess.Popen(
@@ -1408,13 +1423,16 @@ def run_fileless_execution_loader(timeout=50, binary="./fe_loader", out_file=mem
             os.killpg(os.getpgid(p.pid), signal.SIGTERM)
         except Exception:
             pass
-
     atexit.register(terminate)
 
-    time.sleep(timeout)
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+        except Exception:
+            pass
 
-    if p.poll() is None:
-        p.terminate()
 
 def read_memfd_events(out_file=memfd_out_file):
     pids = []
@@ -1431,41 +1449,6 @@ def read_memfd_events(out_file=memfd_out_file):
     except FileNotFoundError:
         pass
     return pids
-
-def check_python_imports(pid, lib):
-    if pid == CURRENT_PID or pid in DETECTED_PROCESSES:
-        return None
-    detections = {"pid": pid, "path": None, "modules": set()}
-    logs = []
-    try:
-        process = psutil.Process(pid)
-        cmdline = process.cmdline()
-
-        if len(cmdline) > 1:
-            detections["path"] = os.path.join(process.cwd(), cmdline[1])
-
-        checker = ModuleChecker(pid, lib)
-        maps = checker.get_libs_using_mem_maps()
-
-        if maps:
-            for mod in maps:
-                detections["modules"].add(mod)
-                logs.append(f"[maps] Found `{mod}` in /proc/{pid}/maps")
-
-        for fd in os.listdir(f"/proc/{pid}/fd"):
-            fd_path = os.readlink(f"/proc/{pid}/fd/{fd}")
-            for mod in lib:
-                if mod in fd_path:
-                    detections["modules"].add(mod)
-                    logs.append(f"[fd] Found `{mod}` in file descriptor path")
-
-        if detections["modules"]:
-            DETECTED_PROCESSES.add(pid)
-            return detections, logs
-        return None
-
-    except (psutil.AccessDenied, FileNotFoundError, psutil.NoSuchProcess, PermissionError):
-        return None
 
 safe_process_signatures = set()
 def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, terminal, user, uptime):
@@ -1547,10 +1530,11 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
             sus_score += 1
             reasons.append("Running as root")
 
-        libraries, rt = has_suspicious_modules(full_path, sus_libraries)
-        if rt:
+        h_output = has_suspicious_modules(full_path, sus_libraries)
+        if h_output:
             sus_score += 2
-            reasons.append(f"Contains suspicious modules: {libraries}")
+            for library in h_output:
+                reasons.append(f"Contains suspicious modules: {library}")
 
         if full_path in known_safe_programs or any(full_path.startswith(wp) for wp in white_list_paths):
             check = True
@@ -1695,7 +1679,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 if choice == 'Y' or choice == 'y':
                     confidence, access_rate = x.check_x11_connection(target_pid)
                     o_reasons = ba.check_obfuscated_or_packed_binaries(target_pid)
-
+                   
                     if o_reasons:
                         suspicious_candidates.add(target_pid)
                         for reason in o_reasons:
@@ -1736,6 +1720,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 print(f"[!] PID {target_pid} is not accessible.")
                 return
         else:
+            run_fileless_execution_loader()
             print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Trying to find KeyLogger(s)")
             for p in psutil.process_iter(['pid', 'ppid']):
                 try:
@@ -1762,6 +1747,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                         suspicious_candidates.add(p.pid)
                         reasons_by_pid[p.pid].add("Has input access through X11")
                         log(f"X11 access activity detected for PID {p.pid}", is_log)
+                    
 
                     if bpf.check_pid(p.pid):
                         reasons_by_pid[p.pid].add("Accessing Input Devices confirmed using - BPF")
@@ -1772,8 +1758,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     log(f"Skipped PID {p.pid} (process not accessible)", is_log)
                     continue
-
-            
+    
             for pid in input_access_pids:
                 suspicious_candidates.add(pid)
                 reasons_by_pid[pid].add("Has direct input access")
@@ -1797,8 +1782,17 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     log(f"Skipping PID {pid} (process unavailable)", is_log)
                     continue
+            
+            # No idea, why did I create a separate ebpf binary for finding process that run in memory when our main goal was to find processes that access /dev/input and others.. will think about this
+            # mem_pids = read_memfd_events()
+            # if mem_pids:
+            #     print(mem_pids)
+            #     for m_pid in mem_pids:
+            #         suspicious_candidates.add(m_pid)
+            #         reasons_by_pid[m_pid].add("Running directly From Memory")
+            #         log(f"Running directly from memory with PID {m_pid}", is_log)
 
-        log("Reporting phase started for suspicious PID's", is_log)
+        log(f"Reporting phase started for suspicious PID's {suspicious_pids}", is_log)
         
         if target_pid:
             check_and_report(fullpaths, trusted_paths, unrecognized_paths,
@@ -1886,13 +1880,16 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
     for pid in suspicious_pids:
         path = fullpaths.get(pid)
         if path:
-            module_name, sus_score = has_suspicious_modules(path, load_sus_libraries())
-            sus_scores[pid] = sus_score
-            if sus_score and module_name and sus_score >= 4:
-                high_sus_string_pids.append(pid)
-                reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
-            else:
-                normal_suspects.append(pid)
+    
+            h_output = has_suspicious_modules(path, load_sus_libraries())
+            if h_output:
+                for module_name, sus_score in h_output.items():
+                    sus_scores[pid] = sus_score
+                    if sus_score and module_name and sus_score >= 4:
+                        high_sus_string_pids.append(pid)
+                        reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
+                    else:
+                        normal_suspects.append(pid)
 
     final_suspects = list(set(high_sus_string_pids + normal_suspects))
     final_suspects = [pid for pid in final_suspects if pid in fullpaths]
@@ -2811,6 +2808,6 @@ if __name__ == "__main__":
             print("\n[*] Scan interrupted by user. Exiting...")
     else:
         # intial_system_checks(args.log)
-        output = m.check_obfuscated_or_packed_binaries()
-        print(output)
+        mem_pids = read_memfd_events()
+     
 
