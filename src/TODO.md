@@ -24,13 +24,13 @@
 - read_memfd_events
 - check_device_type
 - get_device_names_from_bpf_file
+- check_impersonating_process
+- check_hidraw_connections
+- Class ParentProcessValidator
 
 Next: 
 #### NOT INTEGRATED FUNCTIONS/CLASSES YET TO THE MAIN FLOW ####
-- check_impersonating_process
-- check_hidraw_connections
 - kill_process
-- Class ParentProcessValidator
 - Class ModuleChecker
 - Add log option to reasons for more verbose reasoning
 - Add log, explaining why a process is trusted
