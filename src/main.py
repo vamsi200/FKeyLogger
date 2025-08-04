@@ -1251,17 +1251,16 @@ def check_hidraw_connections(pid):
                     if os.path.exists(target):
                         st = os.stat(target)
                         if stat.S_ISCHR(st.st_mode):
-                            return True
+                            return True, target
             except FileNotFoundError:
                 continue
             except PermissionError:
                 continue
             except Exception as e:
-                print(f"Error reading {fd_path}: {e}")
+                print(f"{e}")
     except Exception as e:
-        print(f"Failed to read /proc/{pid}/fd: {e}")
-    return False
-
+        print(f"{e}")
+    return False, None
 
 def kill_process(pid):
     p = None
@@ -1696,19 +1695,12 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 choice = input("> Proceed furthur? (y/n): ").strip()
                 if choice == 'Y' or choice == 'y':
                     confidence, access_rate = x.check_x11_connection(target_pid)
-                    o_reasons = ba.check_obfuscated_or_packed_binaries(target_pid)
-                    is_impersonate_process, rs = check_impersonating_process(target_pid)
+                    is_using_hidraw, hidraw_name = check_hidraw_connections(target_pid)
 
-                    if is_impersonate_process:
+                    if is_using_hidraw:
                         suspicious_candidates.add(target_pid)
-                        reasons_by_pid[target_pid].add(rs)
-                        log(f"{target_pid}, {rs}", is_log)
-
-                    if o_reasons:
-                        suspicious_candidates.add(target_pid)
-                        for reason in o_reasons:
-                            reasons_by_pid[target_pid].add(reason)
-                            log(f"PID - {target_pid} {reason}", is_log)
+                        reasons_by_pid[target_pid].add("Has direct hidraw access")
+                        log(f"PID - {p.pid} -> has direct access to {hidraw_name}", is_log)
 
                     if confidence >= 3 and access_rate > 0:
                         suspicious_candidates.add(target_pid)
@@ -1723,7 +1715,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                             reasons_by_pid[target_pid].add("Accessing Input Devices confirmed using - BPF")
                             if target_pid is not None:
                                 print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID - {target_pid}")
-
+                    
                     if path:
                         fullpaths[target_pid] = path
                         if sockets:
@@ -1768,12 +1760,12 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                                 continue
 
                     confidence, access_rate = x.check_x11_connection(p.pid)
-                    is_impersonate_process, rs = check_impersonating_process(p.pid)
+                    is_using_hidraw, hidraw_name = check_hidraw_connections(p.pid)
 
-                    if is_impersonate_process:
+                    if is_using_hidraw:
                         suspicious_candidates.add(p.pid)
-                        reasons_by_pid[p.pid].add(rs)
-                        log(f"{p.pid}, {rs}", is_log)
+                        reasons_by_pid[p.pid].add("Has direct hidraw access")
+                        log(f"PID - {p.pid} -> has direct access to {hidraw_name}", is_log)
 
                     if confidence >= 3 and access_rate > 0:
                         suspicious_candidates.add(p.pid)
@@ -1883,27 +1875,33 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             print(f" {symbol} {c}")
 
 
-
     for pid in list(suspicious_pids):
+        is_impersonate_process, rs = check_impersonating_process(pid)
+        if is_impersonate_process:
+            reasons_by_pid[pid].add(rs)
+
+        o_reasons = ba.check_obfuscated_or_packed_binaries(pid)
+        if o_reasons:
+            for reason in o_reasons:
+                reasons_by_pid[pid].add(reason)
+
         if fm.check_file_activity(pid, 1):
             reasons_by_pid[pid].add("Has file Input/Output")
 
-    for pid in list(suspicious_pids):
         rt, out = pc.check_persistence(pid)
         if rt:
             reasons_by_pid[pid].add(f"is persistent: {out}")
 
-    for pid in list(suspicious_pids):
         rt, ip = nm.check_network_activity(pid, 5)
         if rt and ip:
             reasons_by_pid[pid].add(f"has foreign connections: {ip}")
 
-    for pid in list(suspicious_pids):
         path = fullpaths.get(pid)
         if path:
             rt, string_name = has_suspicious_strings(path)
             if rt and string_name:
                 reasons_by_pid[pid].add(f"has suspicious strings: {string_name}")
+
 
     high_sus_string_pids = []
     normal_suspects = []
@@ -1915,14 +1913,15 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
         if path:
     
             h_output = has_suspicious_modules(path, load_sus_libraries())
+            
             if h_output:
                 for module_name, sus_score in h_output.items():
                     sus_scores[pid] = sus_score
                     if sus_score and module_name and sus_score >= 4:
                         high_sus_string_pids.append(pid)
                         reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
-                    else:
-                        normal_suspects.append(pid)
+            else:
+                normal_suspects.append(pid)
 
     final_suspects = list(set(high_sus_string_pids + normal_suspects))
     final_suspects = [pid for pid in final_suspects if pid in fullpaths]
@@ -1934,7 +1933,7 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             child_group[ppid].append(pid)
         else:
             printed_pids.add(pid)
-
+    
     # Single Pid part
     if s_pid:
         for pid in sorted(final_suspects):
@@ -2027,8 +2026,6 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
 
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     print(f" [PID {pid}]  <process info unavailable>")
-
-
 
     elif not printed_pids and scan:
         print("\n" + "-" * 50)
@@ -2194,12 +2191,12 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
         reasons_by_pid[pid].add("Has input access through X11")
         log(f"Using X11 to access Input devices for PID - {pid}", is_log_enabled)
     
-    is_impersonate_process, rs = check_impersonating_process(pid)
+    is_using_hidraw, hidraw_name = check_hidraw_connections(pid)
 
-    if is_impersonate_process:
+    if is_using_hidraw:
         suspicious_candidates.add(pid)
-        reasons_by_pid[pid].add(rs)
-        log(f"{pid}, {rs}", is_log_enabled)
+        reasons_by_pid[pid].add("Has direct hidraw access")
+        log(f"PID - {pid} -> has direct access to {hidraw_name}", is_log_enabled)
 
     for pid, input_device_path in input_access_pids.items():
         suspicious_candidates.add(pid)
@@ -2847,10 +2844,10 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
     else:
-        intial_system_checks(args.log)
+        # intial_system_checks(args.log)
         # out = check_impersonating_process(879837)
-        # print(out)
         # out = k.get_device_names_from_bpf_file()
         # # mem_pids = read_memfd_events()
-     
+        out = check_hidraw_connections(895146)
+        print(out)
 
