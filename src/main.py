@@ -1262,22 +1262,23 @@ def check_hidraw_connections(pid):
         print(f"{e}")
     return False, None
 
-def kill_process(pid):
-    p = None
-    try:
-        p = psutil.Process(pid)
-        p.terminate()
-        p.wait(timeout=5)
-        print("Job Done.")
-    except psutil.NoSuchProcess:
-        print(f"No such process with PID {pid}.")
-    except psutil.TimeoutExpired:
-        if p:
-            p.kill()
-            print(f"Timeout: Process {pid} did not terminate within the timeout.")
-            print(f"Process {pid} forcefully terminated.")
-    except psutil.AccessDenied:
-        print(f"Access denied to kill {pid}.")
+#TODO: will have to think about this
+# def kill_process(pid):
+#     p = None
+#     try:
+#         p = psutil.Process(pid)
+#         p.terminate()
+#         p.wait(timeout=5)
+#         print("Job Done.")
+#     except psutil.NoSuchProcess:
+#         print(f"No such process with PID {pid}.")
+#     except psutil.TimeoutExpired:
+#         if p:
+#             p.kill()
+#             print(f"Timeout: Process {pid} did not terminate within the timeout.")
+#             print(f"Process {pid} forcefully terminated.")
+#     except psutil.AccessDenied:
+#         print(f"Access denied to kill {pid}.")
 
 
 # idea is to find a suspicious input device based on heuristics, - will have to improve in future
@@ -1834,6 +1835,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
 
 
 def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False, s_pid=False, is_log_enabled=False):
+
     if trusted_paths and scan and not s_pid:
         print()
         print("\033[1;34m┌" + "─" * 58 + "┐\033[0m")
@@ -1874,7 +1876,8 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             symbol = "╰─" if idx == len(checks) else "├─"
             print(f" {symbol} {c}")
 
-
+    
+    pa = ParentProcessValidator()
     for pid in list(suspicious_pids):
         is_impersonate_process, rs = check_impersonating_process(pid)
         if is_impersonate_process:
@@ -1901,6 +1904,11 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             rt, string_name = has_suspicious_strings(path)
             if rt and string_name:
                 reasons_by_pid[pid].add(f"has suspicious strings: {string_name}")
+
+        rt, p_output = pa.get_sus_parent_process(pid)
+        if rt and p_output:
+            reasons_by_pid[pid].add(f"{p_output}")
+
 
 
     high_sus_string_pids = []
@@ -2844,10 +2852,15 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
     else:
-        # intial_system_checks(args.log)
+        intial_system_checks(args.log)
         # out = check_impersonating_process(879837)
         # out = k.get_device_names_from_bpf_file()
         # # mem_pids = read_memfd_events()
-        out = check_hidraw_connections(895146)
-        print(out)
-
+        # out = check_hidraw_connections(895146)
+        # print(out)
+        # mc = ModuleChecker(
+        #     984387, load_sus_libraries()
+        # )
+        # output = mc.get_libs_using_mem_maps()
+        # for ps in output:
+        #     print(ps)
