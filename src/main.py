@@ -1234,10 +1234,10 @@ def check_impersonating_process(pid):
             l_path = any(full_path.startswith(p) for p in white_list_paths)
             if not l_path and name in ["systemd", "bash", "cron", "init", "sshd", "Xorg", "zsh"]:
                 return True, f"Process name impersonates system binary: {name}"
-            return False, None    
+        return False, None    
     except Exception as e:
         print(f"{e}")
-        return False
+        return False, None
 
 # assuming that a process wont try to hide access to hidraw
 def check_hidraw_connections(pid):
@@ -1648,7 +1648,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
 
     if out:
         for p, d in sorted(out):
-            log(f"PID {p} -> {d}", is_log)
+            print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} PID {p} -> {d}")
     
 
     if input_access_pids and is_log:
@@ -1697,7 +1697,13 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 if choice == 'Y' or choice == 'y':
                     confidence, access_rate = x.check_x11_connection(target_pid)
                     o_reasons = ba.check_obfuscated_or_packed_binaries(target_pid)
-                   
+                    is_impersonate_process, rs = check_impersonating_process(target_pid)
+
+                    if is_impersonate_process:
+                        suspicious_candidates.add(target_pid)
+                        reasons_by_pid[target_pid].add(rs)
+                        log(f"{target_pid}, {rs}", is_log)
+
                     if o_reasons:
                         suspicious_candidates.add(target_pid)
                         for reason in o_reasons:
@@ -1739,6 +1745,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 return
         else:
             run_fileless_execution_loader()
+            print()
             print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Trying to find KeyLogger(s)")
             for p in psutil.process_iter(['pid', 'ppid']):
                 try:
@@ -1761,6 +1768,13 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                                 continue
 
                     confidence, access_rate = x.check_x11_connection(p.pid)
+                    is_impersonate_process, rs = check_impersonating_process(p.pid)
+
+                    if is_impersonate_process:
+                        suspicious_candidates.add(p.pid)
+                        reasons_by_pid[p.pid].add(rs)
+                        log(f"{p.pid}, {rs}", is_log)
+
                     if confidence >= 3 and access_rate > 0:
                         suspicious_candidates.add(p.pid)
                         reasons_by_pid[p.pid].add("Has input access through X11")
@@ -2075,7 +2089,7 @@ def pid_is_trusted(pid, hash):
 # just to be sure
 
 # --monitor option
-def phase_one_analysis(interval=5, is_log_enabled=False, scan_all=False):
+def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
     spinner = itertools.cycle(['-', '\\', '|', '/'])
 
     print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Monitoring Started.")
@@ -2179,6 +2193,13 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
         suspicious_candidates.add(pid)
         reasons_by_pid[pid].add("Has input access through X11")
         log(f"Using X11 to access Input devices for PID - {pid}", is_log_enabled)
+    
+    is_impersonate_process, rs = check_impersonating_process(pid)
+
+    if is_impersonate_process:
+        suspicious_candidates.add(pid)
+        reasons_by_pid[pid].add(rs)
+        log(f"{pid}, {rs}", is_log_enabled)
 
     for pid, input_device_path in input_access_pids.items():
         suspicious_candidates.add(pid)
@@ -2811,7 +2832,7 @@ if __name__ == "__main__":
             print("\n[*] Scan interrupted by user. Exiting...")
     elif args.monitor:
         try:
-            phase_one_analysis(10, args.log, args.all)
+            monitor_process(10, args.log, args.all)
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
     elif args.p:
@@ -2827,6 +2848,8 @@ if __name__ == "__main__":
             print("\n[*] Scan interrupted by user. Exiting...")
     else:
         intial_system_checks(args.log)
+        # out = check_impersonating_process(879837)
+        # print(out)
         # out = k.get_device_names_from_bpf_file()
         # # mem_pids = read_memfd_events()
      
