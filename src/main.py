@@ -1690,9 +1690,12 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
 
                 except psutil.NoSuchProcess as e:
                     print(f"{e}")
-
+                
+                
                 p = psutil.Process(target_pid)
                 path = get_path(p.cwd(), p.cmdline(), p.exe())
+
+
                 choice = input("> Proceed furthur? (y/n): ").strip()
                 if choice == 'Y' or choice == 'y':
                     confidence, access_rate = x.check_x11_connection(target_pid)
@@ -1706,7 +1709,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                     if confidence >= 3 and access_rate > 0:
                         suspicious_candidates.add(target_pid)
                         reasons_by_pid[target_pid].add("Has input access through X11")
-                        log(f"X11 access activity detected for PID {target_pid} (confidence: {confidence}, rate: {access_rate})", is_log)
+                        log(f"X11 access activity detected for PID {target_pid} (confidence: {confidence}, access rate: {access_rate})", is_log)
                     parent_map[target_pid] = p.ppid()
 
                     if target_pid in input_access_pids:
@@ -1823,11 +1826,11 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
         if target_pid:
             check_and_report(fullpaths, trusted_paths, unrecognized_paths,
                          suspicious_pids, reasons_by_pid, parent_map,
-                         ba, fm, pc, nm, scan=True, s_pid=True)
+                         ba, fm, pc, nm, scan=True, s_pid=True, is_log_enabled=is_log)
         else:
             check_and_report(fullpaths, trusted_paths, unrecognized_paths,
                          suspicious_pids, reasons_by_pid, parent_map,
-                         ba, fm, pc, nm, scan=True, s_pid=False)
+                         ba, fm, pc, nm, scan=True, s_pid=False, is_log_enabled=is_log)
 
     except KeyboardInterrupt:
         print("\n[*] Scan interrupted by user. Exiting...")
@@ -1835,7 +1838,6 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
 
 
 def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False, s_pid=False, is_log_enabled=False):
-
     if trusted_paths and scan and not s_pid:
         print()
         print("\033[1;34m┌" + "─" * 58 + "┐\033[0m")
@@ -1882,33 +1884,39 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
         is_impersonate_process, rs = check_impersonating_process(pid)
         if is_impersonate_process:
             reasons_by_pid[pid].add(rs)
+            log(f"PID {pid}: Detected impersonating process - {rs}", is_log_enabled)
 
         o_reasons = ba.check_obfuscated_or_packed_binaries(pid)
         if o_reasons:
             for reason in o_reasons:
                 reasons_by_pid[pid].add(reason)
+                log(f"PID {pid}: Detected obfuscation/packing - {reason}", is_log_enabled)
 
         if fm.check_file_activity(pid, 1):
             reasons_by_pid[pid].add("Has file Input/Output")
+            log(f"PID {pid}: File I/O activity detected", is_log_enabled)
 
         rt, out = pc.check_persistence(pid)
         if rt:
             reasons_by_pid[pid].add(f"is persistent: {out}")
+            log(f"PID {pid}: Persistence detected - {out}", is_log_enabled)
 
         rt, ip = nm.check_network_activity(pid, 5)
         if rt and ip:
             reasons_by_pid[pid].add(f"has foreign connections: {ip}")
+            log(f"PID {pid}: Foreign network connection - {ip}", is_log_enabled)
 
         path = fullpaths.get(pid)
         if path:
             rt, string_name = has_suspicious_strings(path)
             if rt and string_name:
                 reasons_by_pid[pid].add(f"has suspicious strings: {string_name}")
+                log(f"PID {pid}: Suspicious strings found - {string_name}", is_log_enabled)
 
         rt, p_output = pa.get_sus_parent_process(pid)
         if rt and p_output:
             reasons_by_pid[pid].add(f"{p_output}")
-
+            log(f"PID {pid}: Suspicious parent process - {p_output}", is_log_enabled)
 
 
     high_sus_string_pids = []
@@ -1919,17 +1927,28 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
     for pid in suspicious_pids:
         path = fullpaths.get(pid)
         if path:
-    
-            h_output = has_suspicious_modules(path, load_sus_libraries())
-            
-            if h_output:
-                for module_name, sus_score in h_output.items():
-                    sus_scores[pid] = sus_score
-                    if sus_score and module_name and sus_score >= 4:
-                        high_sus_string_pids.append(pid)
-                        reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
+            if path.endswith(".py"):
+                    mc = ModuleChecker(pid, load_sus_libraries())
+                    rt, py_spy_logs = mc.get_modules_using_py_spy()
+                    if rt:
+                        for f in py_spy_logs:
+                            reasons_by_pid[pid].add(f"has suspicious modules: {f}")
+                            high_sus_string_pids.append(pid)
+                            log(f"Found Suspicious libraries using py-spy: {f}", is_log_enabled)
+                    else:
+                        normal_suspects.append(pid)
+
             else:
-                normal_suspects.append(pid)
+                h_output = has_suspicious_modules(path, load_sus_libraries())
+                if h_output:
+                    for module_name, sus_score in h_output.items():
+                        sus_scores[pid] = sus_score
+                        if sus_score and module_name and sus_score >= 4:
+                            high_sus_string_pids.append(pid)
+                            reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
+                            log(f"Found Suspicious libraries: {module_name}", is_log_enabled)
+                else:
+                    normal_suspects.append(pid)
 
     final_suspects = list(set(high_sus_string_pids + normal_suspects))
     final_suspects = [pid for pid in final_suspects if pid in fullpaths]
@@ -1941,7 +1960,7 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             child_group[ppid].append(pid)
         else:
             printed_pids.add(pid)
-    
+   
     # Single Pid part
     if s_pid:
         for pid in sorted(final_suspects):
@@ -2250,7 +2269,8 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
         fm,
         pc,
         nm,
-        scan=False
+        scan=False,
+        is_log_enabled=is_log_enabled
     )
 
 def prompt_user_trust_a_process():
