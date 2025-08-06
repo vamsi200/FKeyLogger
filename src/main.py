@@ -1846,9 +1846,11 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                         fullpaths[pid] = path
                         if sockets:
                             for file in sockets:
-                                result, reason_list, _ = ba.check_file_authenticity(file, path, pid)
+                                result, reason_list, trusted_reasons_list = ba.check_file_authenticity(file, path, pid)
                                 if not result:
                                     trusted_paths.add(path)
+                                    for treason in trusted_reasons_list:
+                                        trusted_reasons_by_pid[pid].add(treason)
                                 else:
                                     unrecognized_paths.add(path)
                                     suspicious_pids.add(pid)
@@ -1869,7 +1871,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
         
         for sp in suspicious_pids:
             log(f"Reporting phase started for suspicious PID's {sp}", is_log)
-        
+
         if target_pid:
             check_and_report(fullpaths, trusted_paths, unrecognized_paths,
                          suspicious_pids, reasons_by_pid, parent_map,
@@ -1928,6 +1930,7 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
     
     pa = ParentProcessValidator()
     for pid in list(suspicious_pids):
+        path = fullpaths.get(pid, '[unknown path]')
         is_impersonate_process, rs = check_impersonating_process(pid)
         if is_impersonate_process:
             reasons_by_pid[pid].add(rs)
@@ -1947,7 +1950,7 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
         if rt:
             reasons_by_pid[pid].add(f"is persistent: {out}")
             log(f"PID {pid}: Persistence detected - {out}", is_log_enabled)
-
+        
         network_activity = nm.check_network_activity(pid, 5)       
         if network_activity.get("outbound_ips"):
             for ip in network_activity["outbound_ips"]:
@@ -1957,7 +1960,6 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
         if network_activity.get("port_forwarding"):
             reasons_by_pid[pid].add("possible port forwarding behavior detected")
             log(f"PID {pid}: Possible port forwarding behavior detected", is_log_enabled)
-            path = fullpaths.get(pid)
             if path:
                 rt, string_name = has_suspicious_strings(path)
                 if rt and string_name:
@@ -1968,6 +1970,19 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
         if rt and p_output:
             reasons_by_pid[pid].add(f"{p_output}")
             log(f"PID {pid}: Suspicious parent process - {p_output}", is_log_enabled)
+        
+
+
+    # trusted_reasons = set()
+    # trusted_reasons.add("Parent process does not match suspicious patterns")
+    # trusted_reasons.add("Binary is not obfuscated or packed")
+    # trusted_reasons.add("No unexpected file input/output activity")
+    # trusted_reasons.add("Process is not persistent")
+    # trusted_reasons.add("No foreign network connections detected")
+    # trusted_reasons.add("No port forwarding behavior detected")
+    # trusted_reasons.add("No suspicious strings found in binary")
+    # trusted_reasons.add("Parent process appears expected")
+    # trusted_reason_list[pid] = trusted_reasons
 
 
     high_sus_string_pids = []
@@ -1975,6 +1990,10 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
     sus_scores = {}
     child_group = defaultdict(list)
     
+    if trusted_reason_list:
+        for p,s in trusted_reason_list.items():
+            print("LIST after - {}, {}", p, s)
+
     for pid in suspicious_pids:
         path = fullpaths.get(pid)
         if path:
@@ -2130,6 +2149,22 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
         print(" No suspicious keylogger activity found. ".center(50))
         print("-" * 50)
 
+    if is_log_enabled and trusted_reason_list:
+        for pid, reasons in trusted_reason_list.items():
+            if not reasons:
+                continue
+            process_info = ""
+            if 'fullpaths' in locals() and pid in fullpaths:
+                process_info = f" ({fullpaths[pid]})"
+            print(f"\033[1;32mPID {pid}{process_info}\033[0m:")
+            print(" ├─ \033[1;32mTrusted for the following reasons:\033[0m")
+            sorted_reasons = sorted(reasons)
+            for idx, reason in enumerate(sorted_reasons):
+                symbol = "╰─" if idx == len(sorted_reasons) - 1 else "├─"
+                print(f" │  {symbol} {reason}")
+            print()
+
+
 
     # Monitor part
     elif not scan and not s_pid and printed_pids:
@@ -2271,7 +2306,6 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
     trusted_paths = set()
     unrecognized_paths = set()
     suspicious_pids = set()
-    
     print()
     log(f"Detected {len(sockets)} suspicious IPC socket(s).", is_log_enabled)
 
@@ -2312,6 +2346,7 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
                 fullpaths[pid] = path
                 if sockets:
                     for file in sockets:
+                        #TODO: will think whether to add the trust list for monitoring.. or too much noise?? 
                         result, reason_list, _ = ba.check_file_authenticity(file, path, pid)
                         if not result:
                             trusted_paths.add(path)
@@ -2336,7 +2371,7 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
         pc,
         nm,
         scan=False,
-        is_log_enabled=is_log_enabled
+        is_log_enabled=is_log_enabled,
     )
 
 def prompt_user_trust_a_process():
