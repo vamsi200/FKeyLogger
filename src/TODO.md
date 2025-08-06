@@ -27,14 +27,13 @@
 - check_impersonating_process
 - check_hidraw_connections
 - Class ParentProcessValidator
+- Class ModuleChecker - added, but not everything
+- kill_process
 
 Next: 
 #### NOT INTEGRATED FUNCTIONS/CLASSES YET TO THE MAIN FLOW ####
-- kill_process
-- Class ModuleChecker
 - Add log option to reasons for more verbose reasoning
 - Add log, explaining why a process is trusted
-
 
 FS:
 - Maybe in way future, implement sandboxing?
