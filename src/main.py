@@ -252,25 +252,44 @@ class ParentProcessValidator:
 
 class BinaryAnalyzer:
     def is_trusted_binary(self, path):
+        reasons = []
         try:
             if not os.path.exists(path):
-                return False
+                reasons.append(f"Binary not found: {path}")
+                return False, reasons
 
             st = os.stat(path)
             trusted_dirs = ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/lib", "/lib64", "/usr/lib")
 
             if not path.startswith(trusted_dirs):
-                return False
+                reasons.append(f"Binary path is not in a trusted directory: {path}")
+                return False, reasons
+            else:
+                reasons.append(f"Binary is in a trusted system directory: {path}")
 
-            if st.st_uid != 0 or (st.st_mode & 0o002):
-                return False
+            if st.st_uid != 0:
+                reasons.append(f"Binary not owned by root (UID={st.st_uid})")
+                return False, reasons
+            else:
+                reasons.append("Binary is owned by root")
+
+            if (st.st_mode & 0o002):
+                reasons.append("Binary is world-writable")
+                return False, reasons
+            else:
+                reasons.append("Binary is not world-writable")
 
             if not get_binary_info(path):
-                return False
+                reasons.append("Binary not found in the system package manager database")
+                return False, reasons
+            else:
+                reasons.append("Binary is registered with the system package manager")
 
-            return True
-        except Exception:
-            return False
+            return True, reasons
+
+        except Exception as e:
+            reasons.append(f"Exception during trust check: {e}")
+            return False, reasons
 
     def is_upx_packed(self, path):
         try:
@@ -326,6 +345,7 @@ class BinaryAnalyzer:
     def check_file_authenticity(self, file_path, full_path, pid=None):
         suspicious_dirs = ["/tmp", "/dev/shm", "/var/tmp", "/run", "/home"]
         reasons = []
+        trusted_reasons = []
         st = os.stat(full_path)
 
         def process_matches(proc):
@@ -335,46 +355,59 @@ class BinaryAnalyzer:
                         if str(file_path) in str(file.path):
                             reasons.append(f"Process {proc.pid} has opened a socket : {file_path}")
                             return True
+                trusted_reasons.append("No suspicious files or sockets opened by the process")
 
                 if "memfd:" in full_path or "(deleted)" in full_path:
                     reasons.append(f"Executable is memory-loaded or deleted: {full_path}")
                     return True
+                trusted_reasons.append("Executable is loaded from disk (not memory-resident or deleted)")
 
-                if not self.is_trusted_binary(full_path):
+                is_trusted, trust_reasons = self.is_trusted_binary(full_path)
+                if not is_trusted:
                     reasons.append(f"Running from a Untrusted binary path: {full_path}")
+                    reasons.extend(trust_reasons)
                     return True
+                else:
+                    trusted_reasons.extend(trust_reasons)
 
                 if any(full_path.startswith(d) for d in suspicious_dirs):
                     reasons.append(f"Executable in suspicious directory: {full_path}")
                     return True
-                
+                trusted_reasons.append("Binary path not found in any suspicious directory")
+
                 if full_path.startswith(("/usr", "/bin", "/sbin")) and st.st_uid != 0:
                     reasons.append(f"System binary not owned by root: {full_path}")
                     return True
+                if full_path.startswith(("/usr", "/bin", "/sbin")) and st.st_uid == 0:
+                    trusted_reasons.append("System binary is owned by root (expected)")
 
                 if os.access(full_path, os.W_OK) and str(full_path) in suspicious_dirs:
                     reasons.append(f"Executable is writable: {full_path}")
                     return True
+                trusted_reasons.append("Executable is not writable by this user")
 
             except Exception as e:
                 reasons.append(f"Exception while analyzing process {proc.pid}: {e}")
                 return False
 
+            return False
+
         if pid is not None:
             try:
                 proc = psutil.Process(pid)
                 result = process_matches(proc)
-                return result, reasons if result else []
+                if result:
+                    return True, reasons, []
+                else:
+                    return False, [], trusted_reasons
             except psutil.NoSuchProcess:
-                return False, [f"PID {pid} does not exist"]
+                return False, [f"PID {pid} does not exist"], []
         else:
             for proc in psutil.process_iter(['pid']):
                 if process_matches(proc):
-                    return True, reasons
+                    return True, reasons, []
+            return False, [], trusted_reasons
 
-        return False, []
-
-    # Running entropy checks on all the processes would be a cpu intensive task and too time consuming.. so for now, added only for -p option
     def check_obfuscated_or_packed_binaries(self, pid=None):
         seen_paths = set()
 
@@ -1509,7 +1542,7 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
             sus_score += 2
             reasons.append(output)
 
-        rt_value, out = bi.check_file_authenticity(None, full_path=full_path, pid=pid)
+        rt_value, out, _ = bi.check_file_authenticity(None, full_path=full_path, pid=pid)
         if rt_value:
             reasons.append(out)
             sus_score += 2
@@ -1676,6 +1709,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
     trusted_paths = set()
     unrecognized_paths = set()
     suspicious_pids = set()
+    trusted_reasons_by_pid = defaultdict(set)
 
     try:
         if target_pid is not None:
@@ -1707,7 +1741,6 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 p = psutil.Process(target_pid)
                 path = get_path(p.cwd(), p.cmdline(), p.exe())
 
-
                 choice = input("> Proceed furthur? (y/n): ").strip()
                 if choice == 'Y' or choice == 'y':
                     confidence, access_rate = x.check_x11_connection(target_pid)
@@ -1736,9 +1769,11 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                         fullpaths[target_pid] = path
                         if sockets:
                             for file in sockets:
-                                result, reason_list = ba.check_file_authenticity(file, path, target_pid)
+                                result, reason_list, trusted_reason_list = ba.check_file_authenticity(file, path, target_pid)
                                 if not result:
                                     trusted_paths.add(path)
+                                    for treason in trusted_reason_list:
+                                        trusted_reasons_by_pid[target_pid].add(treason)
                                 else:
                                     unrecognized_paths.add(path)
                                     suspicious_pids.add(target_pid)
@@ -1811,7 +1846,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                         fullpaths[pid] = path
                         if sockets:
                             for file in sockets:
-                                result, reason_list = ba.check_file_authenticity(file, path, pid)
+                                result, reason_list, _ = ba.check_file_authenticity(file, path, pid)
                                 if not result:
                                     trusted_paths.add(path)
                                 else:
@@ -1838,18 +1873,18 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
         if target_pid:
             check_and_report(fullpaths, trusted_paths, unrecognized_paths,
                          suspicious_pids, reasons_by_pid, parent_map,
-                         ba, fm, pc, nm, scan=True, s_pid=True, is_log_enabled=is_log)
+                         ba, fm, pc, nm, scan=True, s_pid=True, is_log_enabled=is_log, trusted_reason_list=trusted_reasons_by_pid)
         else:
             check_and_report(fullpaths, trusted_paths, unrecognized_paths,
                          suspicious_pids, reasons_by_pid, parent_map,
-                         ba, fm, pc, nm, scan=True, s_pid=False, is_log_enabled=is_log)
+                         ba, fm, pc, nm, scan=True, s_pid=False, is_log_enabled=is_log, trusted_reason_list=trusted_reasons_by_pid)
 
     except KeyboardInterrupt:
         print("\n[*] Scan interrupted by user. Exiting...")
 
 
 
-def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False, s_pid=False, is_log_enabled=False):
+def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False, s_pid=False, is_log_enabled=False, trusted_reason_list=None):
     if trusted_paths and scan and not s_pid:
         print()
         print("\033[1;34m┌" + "─" * 58 + "┐\033[0m")
@@ -2030,10 +2065,19 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
 
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 print(f"[PID {pid}]  <process info unavailable>")
-
+    
     if s_pid and not final_suspects:
         print(f"[*] No suspicious activity found in the given PID")
-    
+        if trusted_reason_list:
+            pid = next(iter(trusted_reason_list.keys()))
+            reasons = list(trusted_reason_list[pid])
+            if reasons:
+                print(" ├─ Trusted for the following reasons:")
+                for idx, reason in enumerate(reasons):
+                    symbol = "╰─" if idx == len(reasons) - 1 else "├─"
+                    print(f" │  {symbol} {reason}")
+                print()
+
     # Sscan Part
     elif printed_pids and scan and not s_pid:
         print()
@@ -2268,7 +2312,7 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
                 fullpaths[pid] = path
                 if sockets:
                     for file in sockets:
-                        result, reason_list = ba.check_file_authenticity(file, path, pid)
+                        result, reason_list, _ = ba.check_file_authenticity(file, path, pid)
                         if not result:
                             trusted_paths.add(path)
                         else:
