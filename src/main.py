@@ -1983,44 +1983,53 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             try:
                 path = fullpaths.get(pid, '[unknown path]')
                 binary = os.path.basename(path)
-                ppid = parent_map.get(pid, None)
+                is_trusted = ba.is_trusted_binary(path) if 'ba' in locals() else False
+                trust_note = " (recognized system binary)" if is_trusted else ""
+
                 parent_path = '[unknown]'
+                parent_status = ''
+                ppid = parent_map.get(pid, None)
                 if ppid:
                     try:
                         parent = psutil.Process(ppid)
-                        parent_path = os.path.basename(parent.exe())
+                        parent_path_file = parent.exe()
+                        parent_path = os.path.basename(parent_path_file)
+                        if 'ba' in locals():
+                            parent_trust = ba.is_trusted_binary(parent_path_file)
+                            parent_status = f" ({'trusted' if parent_trust else '\033[1;31muntrusted\033[0m'})"
                     except Exception:
                         pass
-                
+
                 print()
                 print("\033[1;31m┌" + "─" * 58 + "┐\033[0m")
                 print("\033[1;31m│" + " POTENTIAL KEYLOGGER(S) DETECTED ".center(58) + "│\033[0m")
                 print("\033[1;31m└" + "─" * 58 + "┘\033[0m")
-              
-                reason_list = sorted(reasons_by_pid.get(pid, []))
-                if reason_list:
-                    print(" ├─ \033[1;33mFlagged due to:\033[0m")
-                    for idx, reason in enumerate(reason_list):
-                        symbol = "╰─" if idx == len(reason_list) - 1 else "├─"
-                        print(f" │  {symbol} {reason}")
-                else:
-                    print(" ├─ Reasons: None found")
 
-                print("\n ├─ Binary Path:")
+                print(f"\033[1;36mPID {pid}\033[0m: {binary} (Parent: {parent_path}{parent_status}){trust_note}")
+
+                reason_list = sorted(reasons_by_pid.get(pid, []))
+                print(" ├─ \033[1;33mFlagged due to:\033[0m")
+                for idx, reason in enumerate(reason_list):
+                    symbol = "╰─" if idx == len(reason_list) - 1 else "├─"
+                    print(f" │  {symbol} {reason}")
+
+                print(" ├─ Binary Path:")
                 print(f" │   {path}")
 
                 if pid in child_group and child_group[pid]:
-                    print("\n └─ Child Processes:")
-                    for idx, child_pid in enumerate(sorted(child_group[pid])):
+                    print(" └─ Child Processes:")
+                    cgroup = child_group[pid]
+                    for idx, child_pid in enumerate(sorted(cgroup)):
                         child_path = fullpaths.get(child_pid, '[unknown path]')
-                        symbol = "╰─" if idx == len(child_group[pid]) - 1 else "├─"
+                        symbol = "╰─" if idx == len(cgroup) - 1 else "├─"
                         print(f"     {symbol} PID {child_pid}: {child_path}")
                 else:
-                    print("\n └─ Child Processes: None")
-                    
+                    print(" └─ Child Processes: None")
+
+                print(f" (Investigate or kill with:  kill {pid})\n")
+
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 print(f"[PID {pid}]  <process info unavailable>")
-
 
     if s_pid and not final_suspects:
         print(f"[*] No suspicious activity found in the given PID")
@@ -2034,41 +2043,43 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
 
         for pid_group in [high_sus_string_pids, printed_pids - set(high_sus_string_pids)]:
             for pid in sorted(pid_group):
-                try:
-                    p = psutil.Process(pid)
-                    path = fullpaths.get(pid, '[unknown path]')
-                    reason_list = sorted(reasons_by_pid.get(pid, []))
-                    is_trusted = ba.is_trusted_binary(path)
-                    trust_note = " (recognized system binary)" if is_trusted else ""
-
-                    print(f"\n [PID {pid}] {path}{trust_note}")
-
-                    ppid = p.ppid()
+                path = fullpaths.get(pid, '[unknown path]')
+                binary = os.path.basename(path)
+                is_trusted = ba.is_trusted_binary(path)
+                trust_note = " (recognized system binary)" if is_trusted else ""
+                parent_path = '[unknown]'
+                parent_status = ''
+                ppid = parent_map.get(pid, None)
+                if ppid:
                     try:
                         parent = psutil.Process(ppid)
-                        parent_path = parent.exe()
-                        parent_trust = ba.is_trusted_binary(parent_path)
-                        parent_status = "trusted" if parent_trust else "\033[1;31muntrusted\033[0m"
-                        print(f"     ├─ Parent PID {ppid}: {parent_path} ({parent_status})")
+                        parent_path = os.path.basename(parent.exe())
+                        parent_trust = ba.is_trusted_binary(parent.exe())
+                        parent_status = f" ({'trusted' if parent_trust else '\033[1;31muntrusted\033[0m'})"
                     except Exception:
-                        print(f"     ├─ Parent PID {ppid}: <unknown>")
+                        pass
 
-                    if pid in child_group and child_group[pid]:
-                        for idx, child_pid in enumerate(sorted(child_group[pid])):
-                            child_path = fullpaths.get(child_pid, '[unknown path]')
-                            symbol = "└─" if idx == len(child_group[pid]) - 1 else "├─"
-                            print(f"     ├─ Child PID {child_pid}: {child_path}")
-                    else:
-                        print("     ├─ Child Processes: None")
+                print(f"\033[1;36mPID {pid}\033[0m: {binary} (Parent: {parent_path}{parent_status}){trust_note}")
 
-                    print("     ╭─ \033[1;33mFlagged due to:\033[0m")
+                reason_list = sorted(reasons_by_pid.get(pid, []))
+                print(" ├─ \033[1;33mFlagged due to:\033[0m")
+                for idx, reason in enumerate(reason_list):
+                    symbol = "╰─" if idx == len(reason_list) - 1 else "├─"
+                    print(f" │  {symbol} {reason}")
 
-                    for idx, reason in enumerate(reason_list):
-                        symbol = "╰─" if idx == len(reason_list) - 1 else "├─"
-                        print(f"     │  {symbol} {reason}")
+                print(f" ├─ Binary Path:")
+                print(f" │   {path}")
 
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    print(f" [PID {pid}]  <process info unavailable>")
+                if pid in child_group and child_group[pid]:
+                    print(f" └─ Child Processes:")
+                    for idx, child_pid in enumerate(sorted(child_group[pid])):
+                        child_path = fullpaths.get(child_pid, '[unknown path]')
+                        symbol = "╰─" if idx == len(child_group[pid]) - 1 else "├─"
+                        print(f"     {symbol} PID {child_pid}: {child_path}")
+                else:
+                    print(f" └─ Child Processes: None")
+                print(f" (Investigate or kill with:  kill {pid})\n")
+
 
     elif not printed_pids and scan:
         print("\n" + "-" * 50)
@@ -2104,6 +2115,7 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             for idx, reason in enumerate(reason_list):
                 symbol = "╰─" if idx == len(reason_list) - 1 else "├─"
                 print(f" │  {symbol} {reason}")
+            print(f" (Investigate or kill with:  kill {pid})\n")
             print()
 
 
