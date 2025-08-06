@@ -827,13 +827,18 @@ class PersistenceChecker:
         return score, found_pids
 
 class NetworkMonitor:
-    #TODO:
-    # if a process is opening sudden connections
-    # if it is making outbound connections
-    # if a process is doing any port-forwarding -> no idea how to approach this
-    # not a very effective way - since a process could still mask as from white listed ports or paths
     def check_network_activity(self, input_pid, timeout):
         conn_count = defaultdict(int)
+        initial_conn = set()
+        port_forwarding_detected = False
+
+        try:
+            for c in psutil.net_connections(kind='inet'):
+                if c.pid == input_pid and c.status == 'ESTABLISHED':
+                    initial_conn.add((c.laddr, c.raddr))
+        except Exception as e:
+            print(f"[!] Failed to fetch initial connections: {e}")
+            return False, None, False
 
         try:
             for _ in range(timeout):
@@ -844,36 +849,43 @@ class NetworkMonitor:
                             conn_count[i.pid] += 1
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     print("[!] Failed to get the process details during scan")
-                    return False, None
+                    return False, None, False
                 time.sleep(1)
         except Exception as e:
             print(f"[!] Unexpected failure in network activity scan: {e}")
-            return False, None
+            return False, None, False
 
         try:
             conn = psutil.net_connections(kind='inet')
         except Exception:
             print("[!] Failed to get final connections")
-            return False, None
+            return False, None, False
+
+        outbound_ips = set()
+        listens = False
+        established = False
 
         for i in conn:
-            if input_pid == i.pid and i.status is not None:
-                for pid in conn_count:
-                    if pid == i.pid and i.raddr:
+            if i.pid == input_pid:
+                if i.status == 'ESTABLISHED' and i.raddr:
+                    try:
                         ip = i.raddr.ip
-                        try:
-                            if not ipaddress.ip_address(ip).is_private:
-                                p = psutil.Process(pid)
-                                path = p.exe()
+                    except Exception:
+                        ip = None
+                    if ip and not ipaddress.ip_address(ip).is_private:
+                        outbound_ips.add(ip)
+                    established = True
+                if i.status == 'LISTEN':
+                    listens = True
 
-                                if any(path.startswith(sus_path) for sus_path in suspicious_paths):
-                                    return True, ip
-                                return False, None
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            print("[!] Failed to access process info")
-                            return False, None
+        if listens and established:
+            port_forwarding_detected = True
 
-        return False, None
+        return {
+            "outbound_ips": list(outbound_ips),
+            "port_forwarding": port_forwarding_detected
+        }
+
 
 bpf_file = "bpf_output.json"
 or_file = "test.json"
@@ -1901,17 +1913,21 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             reasons_by_pid[pid].add(f"is persistent: {out}")
             log(f"PID {pid}: Persistence detected - {out}", is_log_enabled)
 
-        rt, ip = nm.check_network_activity(pid, 5)
-        if rt and ip:
-            reasons_by_pid[pid].add(f"has foreign connections: {ip}")
-            log(f"PID {pid}: Foreign network connection - {ip}", is_log_enabled)
+        network_activity = nm.check_network_activity(pid, 5)       
+        if network_activity.get("outbound_ips"):
+            for ip in network_activity["outbound_ips"]:
+                reasons_by_pid[pid].add(f"has foreign connection: {ip}")
+                log(f"PID {pid}: Foreign network connection - {ip}", is_log_enabled)
 
-        path = fullpaths.get(pid)
-        if path:
-            rt, string_name = has_suspicious_strings(path)
-            if rt and string_name:
-                reasons_by_pid[pid].add(f"has suspicious strings: {string_name}")
-                log(f"PID {pid}: Suspicious strings found - {string_name}", is_log_enabled)
+        if network_activity.get("port_forwarding"):
+            reasons_by_pid[pid].add("possible port forwarding behavior detected")
+            log(f"PID {pid}: Possible port forwarding behavior detected", is_log_enabled)
+            path = fullpaths.get(pid)
+            if path:
+                rt, string_name = has_suspicious_strings(path)
+                if rt and string_name:
+                    reasons_by_pid[pid].add(f"has suspicious strings: {string_name}")
+                    log(f"PID {pid}: Suspicious strings found - {string_name}", is_log_enabled)
 
         rt, p_output = pa.get_sus_parent_process(pid)
         if rt and p_output:
@@ -2105,12 +2121,6 @@ def pid_is_trusted(pid, hash):
         if entry.get("pid") == str(pid) or entry.get("md5 hash") == str(hash) and entry.get("is trusted") is True:
             return True
 
-
-# Initial stage: go through every running process, do some checks and if our confidence is pretty high and we are certain that it is a legit process then we hash and save it..
-# Second stage: if else, will proceed with furthur checks to confirm if the process is a Keylogger, if yes - then we provide the user with option to kill it - 
-# before that we hash it with a remark this is Keylogger for future comparisons
-# Third stage: if we dont see any, then we keep looking for new process every few minutes and also go through all the checks for all the processes that we hashed - 
-# just to be sure
 
 # --monitor option
 def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
@@ -2808,8 +2818,6 @@ def intial_system_checks(is_log=False):
         print()
 
 
-
-
 def log(msg, is_log_enabled):
     if is_log_enabled:
         timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
@@ -2873,14 +2881,3 @@ if __name__ == "__main__":
             print("\n[*] Scan interrupted by user. Exiting...")
     else:
         intial_system_checks(args.log)
-        # out = check_impersonating_process(879837)
-        # out = k.get_device_names_from_bpf_file()
-        # # mem_pids = read_memfd_events()
-        # out = check_hidraw_connections(895146)
-        # print(out)
-        # mc = ModuleChecker(
-        #     984387, load_sus_libraries()
-        # )
-        # output = mc.get_libs_using_mem_maps()
-        # for ps in output:
-        #     print(ps)
