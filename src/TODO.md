@@ -34,6 +34,10 @@ Next:
 #### NOT INTEGRATED FUNCTIONS/CLASSES YET TO THE MAIN FLOW ####
 - Add log option to reasons for more verbose reasoning
 - Add log, explaining why a process is trusted
+- Need to add the part of creating process.json file for scan_process() function.
+- Fix the parent process thing..
+- Will have to revisit the initial stages of creating process.json file and why a process is being trusted.
+
 
 FS:
 - Maybe in way future, implement sandboxing?
