@@ -22,7 +22,6 @@ import re
 import collections
 import itertools
 import math
-file_path = "process.json"
 white_list_ports = [8080, 443, 22]
 current_user = os.getlogin()
 home_dir = os.path.expanduser('~')
@@ -1508,70 +1507,20 @@ def read_memfd_events(out_file=memfd_out_file):
         pass
     return pids
 
-safe_process_signatures = set()
-def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, terminal, user, uptime):
+def r_process(pid, cwd, cmdline, exe_path,fd, terminal, user, uptime):
     try:
         sus_score = 0
         reasons = []
         full_path = get_path(cwd, cmdline, exe_path)
         check = False
         pv = ParentProcessValidator()
-        pc = PersistenceChecker()
-        bi = BinaryAnalyzer() 
         if not full_path or skip_current_pid(full_path, pid):
-            return False
-
-        if pid in input_access_pids:
-            sus_score += 4
-            reasons.append("Accesses input devices")
-
-        try:
-            with open(full_path, 'rb') as f:
-                binary_data = f.read()
-                for lib, weight in sus_libraries.items():
-                    if lib.encode() in binary_data:
-                        sus_score += weight
-                        reasons.append(f"Contains suspicious library: {lib}")
-                        break
-        except Exception as e:
-            print(f"{e}")
-            pass
-        
-        rt, output = pc.check_persistence(pid)
-        if rt:
-            sus_score += 2
-            reasons.append(output)
-
-        rt_value, out, _ = bi.check_file_authenticity(None, full_path=full_path, pid=pid)
-        if rt_value:
-            reasons.append(out)
-            sus_score += 2
-        
-        if bi.is_upx_packed(full_path) or bi.is_deleted_on_disk(pid):
-            sus_score += 1
-            reasons.append("binary is upx packed")
-
-        if bi.is_deleted_on_disk(pid):
-            sus_score += 1
-            reasons.append("binary is deleted on disk")
-
-        # cron_job_score = pc.check_cron_jobs()
-        # if cron_job_score >= 2:
-        #     sus_score += 2
-            
-        parent_process = pv.get_parent_process(pid)
-        if pv.is_legitimate_parent(parent_process):
-            safe_process_signatures.add(full_path)
             return False
 
         if not terminal:
             sus_score += 1
             reasons.append("No controlling terminal")
         
-        if full_path and full_path not in white_list_paths:
-            sus_score += 1
-            reasons.append(f"Running from non-whitelisted path: {full_path}")
-
         if os.path.islink(full_path):
             sus_score += 1
             reasons.append("Binary is a symlink")
@@ -1588,31 +1537,11 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
             sus_score += 1
             reasons.append("Running as root")
 
-        h_output = has_suspicious_modules(full_path, sus_libraries)
-        if h_output:
-            sus_score += 2
-            for library in h_output:
-                reasons.append(f"Contains suspicious modules: {library}")
-
+        parent_process = pv.get_parent_process(pid)
         if full_path in known_safe_programs or any(full_path.startswith(wp) for wp in white_list_paths):
-            check = True
-            return False
-
-        binary_owned_by_package = get_binary_info(full_path)
-        is_path_safe = (
-            full_path in known_safe_programs or
-            any(full_path.startswith(wp) for wp in white_list_paths)
-        )
-        if binary_owned_by_package and is_path_safe:
-            sus_score = max(sus_score - 3, 0)
-            check = True
-        elif binary_owned_by_package:
-            sus_score = max(sus_score - 2, 0)
-            check = True
-        else:
-            sus_score += 1
-            check = False
-            reasons.append("Binary likely not from a package")
+            if get_binary_info(full_path) or pv.is_legitimate_parent(parent_process):
+                check = True
+                return False
 
         if sus_score >= 2:
             return sus_score, full_path, check, reasons
@@ -1620,15 +1549,6 @@ def r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe_path,fd, 
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False
 
-# --scan option 
-# "/dev/input", "/dev/pts", "/dev/tty", "/dev/hidraw*
-# x11 connections
-# ipc channels - sockets 
-# Persistence Checking
-# File Authenticity - check_file_authenticity()
-# check suspicious strings in a binary
-# check file activity - writing or reading a file
-# check active connections to a private ip address
 
 from random import choices
 import string
@@ -1803,6 +1723,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 if path:
                     if skip_current_pid(path, p.pid):
                         continue
+
                 try:
                     if not scan_all:
                         if path:
@@ -1810,25 +1731,25 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                             if pid_is_trusted(p.pid, file_hash):
                                 continue
 
-                    confidence, access_rate = x.check_x11_connection(p.pid)
-                    is_using_hidraw, hidraw_name = check_hidraw_connections(p.pid)
+                            confidence, access_rate = x.check_x11_connection(p.pid)
+                            is_using_hidraw, hidraw_name = check_hidraw_connections(p.pid)
 
-                    if is_using_hidraw:
-                        suspicious_candidates.add(p.pid)
-                        reasons_by_pid[p.pid].add("Has direct hidraw access")
-                        log(f"PID - {p.pid} -> has direct access to {hidraw_name}", is_log)
+                            if is_using_hidraw:
+                                suspicious_candidates.add(p.pid)
+                                reasons_by_pid[p.pid].add("Has direct hidraw access")
+                                log(f"PID - {p.pid} -> has direct access to {hidraw_name}", is_log)
 
-                    if confidence >= 3 and access_rate > 0:
-                        suspicious_candidates.add(p.pid)
-                        reasons_by_pid[p.pid].add("Has input access through X11")
-                        log(f"X11 access activity detected for PID {p.pid}", is_log)
-                    
+                            if confidence >= 3 and access_rate > 0:
+                                suspicious_candidates.add(p.pid)
+                                reasons_by_pid[p.pid].add("Has input access through X11")
+                                log(f"X11 access activity detected for PID {p.pid}", is_log)
+                            
 
-                    if bpf.check_pid(p.pid):
-                        reasons_by_pid[p.pid].add("Accessing Input Devices confirmed using - BPF")
-                        print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID {p.pid}")
+                            if bpf.check_pid(p.pid):
+                                reasons_by_pid[p.pid].add("Accessing Input Devices confirmed using - BPF")
+                                print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID {p.pid}")
 
-                    parent_map[p.pid] = p.ppid()
+                            parent_map[p.pid] = p.ppid()
 
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     log(f"Skipped PID {p.pid} (process not accessible)", is_log)
@@ -1971,28 +1892,10 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             reasons_by_pid[pid].add(f"{p_output}")
             log(f"PID {pid}: Suspicious parent process - {p_output}", is_log_enabled)
         
-
-
-    # trusted_reasons = set()
-    # trusted_reasons.add("Parent process does not match suspicious patterns")
-    # trusted_reasons.add("Binary is not obfuscated or packed")
-    # trusted_reasons.add("No unexpected file input/output activity")
-    # trusted_reasons.add("Process is not persistent")
-    # trusted_reasons.add("No foreign network connections detected")
-    # trusted_reasons.add("No port forwarding behavior detected")
-    # trusted_reasons.add("No suspicious strings found in binary")
-    # trusted_reasons.add("Parent process appears expected")
-    # trusted_reason_list[pid] = trusted_reasons
-
-
     high_sus_string_pids = []
     normal_suspects = []
     sus_scores = {}
     child_group = defaultdict(list)
-    
-    if trusted_reason_list:
-        for p,s in trusted_reason_list.items():
-            print("LIST after - {}, {}", p, s)
 
     for pid in suspicious_pids:
         path = fullpaths.get(pid)
@@ -2198,7 +2101,7 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             print()
 
 
-
+file_path = "process.json"
 def pid_is_trusted(pid, hash):
     if not os.path.isfile(file_path):
         return False
@@ -2213,6 +2116,8 @@ def pid_is_trusted(pid, hash):
             return True
 
 
+total_pids = set()
+
 # --monitor option
 def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
     spinner = itertools.cycle(['-', '\\', '|', '/'])
@@ -2225,16 +2130,17 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
         print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning all processes, including those marked as trusted.")
     else:
         print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Skipping processes trusted by program heuristics or user configuration.")
+   
+    path_check = set()
+    pid_check = set()
 
     while True:
         i = InputMonitor()
         input_access_pids = i.get_process_using_input_device()
-        sus_libraries = load_sus_libraries()
         parent_map = {}
         bpf = BPFMONITOR(bpf_file, 5)
         bpf.start()
         bpf.stop()
-        path_check = set()
         for index, proc in enumerate(psutil.process_iter(['pid', 'cmdline', 'exe', 'cwd'])):
             pid = proc.info['pid']
             try:
@@ -2253,7 +2159,7 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
             p = get_path(cwd, cmdline, exe)
             if not p or skip_current_pid(p, pid):
                 continue
-
+            
             sys.stdout.write(f"\033[1G")
             sys.stdout.write(f"\033[1G{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning PID - {pid:<6} ({index}) {next(spinner)}")
             sys.stdout.flush()
@@ -2268,15 +2174,19 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
                 hash_flag = False
 
             if proceed:
-                output = r_process(input_access_pids, sus_libraries, pid, cwd, cmdline, exe, fd, terminal, username, uptime)
+                output = r_process(pid, cwd, cmdline, exe, fd, terminal, username, uptime)
 
                 if output and pid:
                     _, path, _, reasons = output
-                    if path not in path_check:
+                    if path not in path_check and pid not in pid_check:
                         path_check.add(path)
+                        pid_check.add(pid)
                         phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log_enabled)
+
                 else:
                     if p:
+                        if pid not in input_access_pids or pid in total_pids:
+                            continue
                         if not hash_and_save(p, pid, name, 0, hash_flag):
                             print(f"[!] Failed to update {file_path}")
 
@@ -2311,17 +2221,20 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
 
     for r in reasons:
         reasons_by_pid[pid].add(change_and_join(r))
+        suspicious_candidates.add(pid)
 
     confidence, access_rate = x.check_x11_connection(pid)
     if confidence >= 3 and access_rate > 0:
         suspicious_candidates.add(pid)
+        total_pids.add(pid)
         reasons_by_pid[pid].add("Has input access through X11")
         log(f"Using X11 to access Input devices for PID - {pid}", is_log_enabled)
-    
+
     is_using_hidraw, hidraw_name = check_hidraw_connections(pid)
 
     if is_using_hidraw:
         suspicious_candidates.add(pid)
+        total_pids.add(pid)
         reasons_by_pid[pid].add("Has direct hidraw access")
         log(f"PID - {pid} -> has direct access to {hidraw_name}", is_log_enabled)
 
@@ -2335,9 +2248,8 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
         output = bpf.check_pid(pid)
         if output:
             reasons_by_pid[pid].add("Input Access verified using - BPF")
-
             log(f"Input Devices access detected using BPF for PID {pid}", is_log_enabled)
-
+    
     for pid in suspicious_candidates:
         try:
             proc = psutil.Process(pid)
