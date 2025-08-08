@@ -29,15 +29,14 @@
 - Class ParentProcessValidator
 - Class ModuleChecker - added, but not everything
 - kill_process
+- Need to add the part of creating process.json file for scan_process() function.
+- Fix the parent process thing.. - working as expected, may have to refine it??
 
 Next: 
-#### NOT INTEGRATED FUNCTIONS/CLASSES YET TO THE MAIN FLOW ####
 - Add log option to reasons for more verbose reasoning
 - Add log, explaining why a process is trusted
-- Need to add the part of creating process.json file for scan_process() function.
-- Fix the parent process thing..
+- A blog post, maybe, on why a method is used and giving rationale as to why we are doing certain things to find keyloggers.
 - Will have to revisit the initial stages of creating process.json file and why a process is being trusted.
-
 
 FS:
 - Maybe in way future, implement sandboxing?
