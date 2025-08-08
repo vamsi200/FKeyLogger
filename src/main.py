@@ -68,6 +68,7 @@ suspicious_paths = [
 CURRENT_SCRIPT_PATH = os.path.realpath(sys.argv[0])
 CURRENT_PID = os.getpid()
 DETECTED_PROCESSES = set()
+total_pids = set()
 
 def skip_current_pid(full_path, pid):
     return (pid == CURRENT_PID or full_path == CURRENT_SCRIPT_PATH)
@@ -363,7 +364,6 @@ class BinaryAnalyzer:
 
                 is_trusted, trust_reasons = self.is_trusted_binary(full_path)
                 if not is_trusted:
-                    reasons.append(f"Running from a Untrusted binary path: {full_path}")
                     reasons.extend(trust_reasons)
                     return True
                 else:
@@ -1608,7 +1608,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
     for sock in sockets:
         log(f"{sock}", is_log)
 
-    out = k.get_device_names_from_bpf_file()
+    out = bpf.get_device_names_from_bpf_file()
     print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} PIDs accessing input devices (keyboard/event) and terminals (pts):")
 
     if out:
@@ -1635,6 +1635,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
         if target_pid is not None:
             try:
                 print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Scanning PID - {target_pid}")
+
                 try:
                     p = psutil.Process(target_pid)
                     path = get_path(p.cwd(), p.cmdline(), p.exe())
@@ -1656,7 +1657,6 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
 
                 except psutil.NoSuchProcess as e:
                     print(f"{e}")
-                
                 
                 p = psutil.Process(target_pid)
                 path = get_path(p.cwd(), p.cmdline(), p.exe())
@@ -1702,67 +1702,80 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 else:
                     print("[*] Exiting..")
                     exit(0)
-
+                
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 print(f"[!] PID {target_pid} is not accessible.")
                 return
+
+            check_and_report(fullpaths, trusted_paths, unrecognized_paths,
+                        suspicious_pids, reasons_by_pid, parent_map,
+                        ba, fm, pc, nm, scan=True, s_pid=True, is_log_enabled=is_log, trusted_reason_list=trusted_reasons_by_pid)
+
         else:
             run_fileless_execution_loader()
             print()
             print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Trying to find KeyLogger(s)")
-            for p in psutil.process_iter(['pid', 'ppid']):
-                try:
-                    cwd = p.cwd()
-                    cmdline = p.cmdline()
-                    exe = p.exe()
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                        log(f"Skipped PID {p.pid} (could not access CWD/cmdline/exe)", is_log)
-                        continue
 
-                path = get_path(cwd, cmdline, exe)
-                if path:
-                    if skip_current_pid(path, p.pid):
-                        continue
+            proceed_map = {}
+            hash_flag_map = {}
+
+            for proc in psutil.process_iter(['pid', 'cmdline', 'exe', 'cwd']):
+                pid = proc.info['pid']
 
                 try:
-                    if not scan_all:
-                        if path:
-                            file_hash = get_file_hash(path)
-                            if pid_is_trusted(p.pid, file_hash):
-                                continue
-
-                            confidence, access_rate = x.check_x11_connection(p.pid)
-                            is_using_hidraw, hidraw_name = check_hidraw_connections(p.pid)
-
-                            if is_using_hidraw:
-                                suspicious_candidates.add(p.pid)
-                                reasons_by_pid[p.pid].add("Has direct hidraw access")
-                                log(f"PID - {p.pid} -> has direct access to {hidraw_name}", is_log)
-
-                            if confidence >= 3 and access_rate > 0:
-                                suspicious_candidates.add(p.pid)
-                                reasons_by_pid[p.pid].add("Has input access through X11")
-                                log(f"X11 access activity detected for PID {p.pid}", is_log)
-                            
-
-                            if bpf.check_pid(p.pid):
-                                reasons_by_pid[p.pid].add("Accessing Input Devices confirmed using - BPF")
-                                print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID {p.pid}")
-
-                            parent_map[p.pid] = p.ppid()
-
+                    cwd = proc.cwd()
+                    cmdline = proc.cmdline()
+                    exe = proc.exe()
+                    name = proc.name()
+                    parent_map[proc.pid] = proc.ppid()
+                    path = get_path(cwd, cmdline, exe)
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    log(f"Skipped PID {p.pid} (process not accessible)", is_log)
+                    log(f"Skipped PID {pid} (could not access CWD/cmdline/exe)", is_log)
                     continue
+
+                confidence, access_rate = x.check_x11_connection(pid)
+                is_using_hidraw, hidraw_name = check_hidraw_connections(pid)
+
+                if is_using_hidraw:
+                    suspicious_candidates.add(pid)
+                    total_pids.add(pid)
+                    reasons_by_pid[pid].add("Has direct hidraw access")
+                    log(f"PID - {pid} -> has direct access to {hidraw_name}", is_log)
+
+                if confidence >= 3 and access_rate > 0:
+                    total_pids.add(pid)
+                    suspicious_candidates.add(pid)
+                    reasons_by_pid[pid].add("Has input access through X11")
+                    log(f"X11 access activity detected for PID {pid}", is_log)
+
+                if bpf.check_pid(pid):
+                    reasons_by_pid[pid].add("Accessing Input Devices confirmed using - BPF")
+                    print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Input Devices access detected using BPF for PID {pid}")
+
+                for input_pid in input_access_pids:
+                    suspicious_candidates.add(input_pid)
+                    total_pids.add(input_pid)
+                    reasons_by_pid[input_pid].add("Has direct input access")
+
+                if not scan_all and path:
+                    file_hash = get_file_hash(path)
+                    proceed = not pid_is_trusted(pid, file_hash)
+                    hash_flag = True
+                else:
+                    proceed = True
+                    hash_flag = False
+
+                proceed_map[pid] = proceed
+                hash_flag_map[pid] = hash_flag
     
-            for pid in input_access_pids:
-                suspicious_candidates.add(pid)
-                reasons_by_pid[pid].add("Has direct input access")
-           
             for pid in suspicious_candidates:
                 try:
                     proc = psutil.Process(pid)
                     path = get_path(proc.cwd(), proc.cmdline(), proc.exe())
+                    name = proc.name()
+                    # if pid not in input_access_pids or pid not in total_pids:
+                    #     continue
+                    
                     if path:
                         fullpaths[pid] = path
                         if sockets:
@@ -1770,6 +1783,11 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                                 result, reason_list, trusted_reasons_list = ba.check_file_authenticity(file, path, pid)
                                 if not result:
                                     trusted_paths.add(path)
+                                    proceed = proceed_map.get(pid, True)
+                                    hash_flag = hash_flag_map.get(pid, False)
+                                    if proceed:
+                                        if not hash_and_save(path, pid, name, 0, hash_flag):
+                                            print(f"[!] Failed to update {path}")
                                     for treason in trusted_reasons_list:
                                         trusted_reasons_by_pid[pid].add(treason)
                                 else:
@@ -1780,27 +1798,17 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     log(f"Skipping PID {pid} (process unavailable)", is_log)
                     continue
-            
-            # No idea, why did I create a separate ebpf binary for finding process that run in memory when our main goal was to find processes that access /dev/input and others.. will think about this
-            # mem_pids = read_memfd_events()
-            # if mem_pids:
-            #     print(mem_pids)
-            #     for m_pid in mem_pids:
-            #         suspicious_candidates.add(m_pid)
-            #         reasons_by_pid[m_pid].add("Running directly From Memory")
-            #         log(f"Running directly from memory with PID {m_pid}", is_log)
-        
-        for sp in suspicious_pids:
-            log(f"Reporting phase started for suspicious PID's {sp}", is_log)
 
-        if target_pid:
-            check_and_report(fullpaths, trusted_paths, unrecognized_paths,
-                         suspicious_pids, reasons_by_pid, parent_map,
-                         ba, fm, pc, nm, scan=True, s_pid=True, is_log_enabled=is_log, trusted_reason_list=trusted_reasons_by_pid)
-        else:
-            check_and_report(fullpaths, trusted_paths, unrecognized_paths,
-                         suspicious_pids, reasons_by_pid, parent_map,
-                         ba, fm, pc, nm, scan=True, s_pid=False, is_log_enabled=is_log, trusted_reason_list=trusted_reasons_by_pid)
+            for sp in suspicious_pids:
+                log(f"Reporting phase started for suspicious PID's {sp}", is_log)
+
+            check_and_report(
+                fullpaths, trusted_paths, unrecognized_paths,
+                suspicious_pids, reasons_by_pid, parent_map,
+                ba, fm, pc, nm,
+                scan=True, s_pid=False, is_log_enabled=is_log,
+                trusted_reason_list=trusted_reasons_by_pid
+            )
 
     except KeyboardInterrupt:
         print("\n[*] Scan interrupted by user. Exiting...")
@@ -2116,7 +2124,6 @@ def pid_is_trusted(pid, hash):
             return True
 
 
-total_pids = set()
 
 # --monitor option
 def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
