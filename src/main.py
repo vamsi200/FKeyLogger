@@ -95,6 +95,25 @@ def load_sus_libraries():
 
 # this only works if a process reads inputs directly from the events
 class InputMonitor:
+    """
+    Monitors active input devices of /dev/input/ and get the processes that is using them.
+    
+    Methods:
+    - get_active_input_devices():
+        Returns a list of paths of active input event devices on the machine.
+
+    - get_process_using_input_device():
+        Scans all running processes and checks their open file descriptors(fd) against the input event devices.
+        then creates a map of process PIDs that are accessing that specific input device in format of -  {pid: {device_path, ...}, ...}.
+
+    - check_input_access_frequency(threshold, timeout):
+        Tracks how frequently each process accesses input devices for a given period - (timeout).
+        Also checks for each process's X11 activity using - check_x11_connection() function, and flags processes with confidence levels above a set `threshold`.
+        Returns a list of suspicious processes, with the PID, type of activity ("evdev" for direct input device access, "x11" for potential keylogging activity like this - [(1, 'x11', 1, 2), (405, 'x11', 1, 1), (1083, 'evdev', 1),...]
+        where x11 represent this - (pid, 'x11', x11_confidence, access_rate) and evdev part this - (pid, 'evdev', evdev_count).
+        Haven't Used anywhere for some reason.. will look into it.
+    """
+
     def get_active_input_devices(self):
         base = "/dev/input/"
         return [os.path.join(base, f) for f in os.listdir(base) if f.startswith("event")]
@@ -172,6 +191,27 @@ class InputMonitor:
 
 class X11Analyzer:
     def check_x11_connection(self, pid):
+        """
+        Analyzes whether a process is connected to the X11 display server and using it for accessing input devices.
+
+        Methods:
+        - check_x11_connection(pid):
+            Checks the given process(pid) for X11 activity by:
+                - Listing socket fd's and match their inodes to active X11 Unix socket connections.
+                - Checking the process's env variables for `XAUTHORITY` and `DISPLAY`.
+                - Checking if the process has loaded X11-related libraries (like libX11.so or libXt.so).
+            Calculates a confidence score:
+                - Each matching signal (socket, environment variables, library) increases the confidence event_real.
+                - The total number of active X11 sockets is reported as access_rate. 
+
+            Returns:
+                A tuple `(confidence, access_rate)` where:
+                    - confidence: an integer score showing that the process is connected to or interacting with X11.
+                    - access_rate: integer, the total count of X11 socket connections that we have detected.
+
+        """
+
+        #TODO: Find alt instead of using `ss`
         confidence = 0
         access_rate = 0
         x11_inodes = set()
@@ -214,6 +254,25 @@ class X11Analyzer:
         return confidence, access_rate
 
 class ParentProcessValidator:
+    """
+    A heuristical(don't know if this word exists) analysis that checks the parent or ancestor(grandparent processes) of a given PID to help us be more confident that if a process is a KeyLogger. It has:
+    - known_safe_parents: A set of process names considered benign or expected as parents (e.g. 'systemd', 'sshd', etc.).
+    - suspicious_parents: A set of process names that may indicate unusual or potentially risky process (e.g. 'cron', 'atd', 'Xorg', session managers, etc.).
+    
+    Methods:
+      - get_parent_process(pid):
+          Returns the direct parent process of the given PID as a psutil.Process object.
+          Returns None if found nothing.
+
+      - is_legitimate_parent(parent_process):
+          Returns True if the given parent process name is listed among known safe parents process.
+          Returns False if not in the list or if the parent process is None.
+
+      - get_sus_parent_process(pid):
+          Checks both the parent and grandparent of the given PID.
+          Returns (True, reason) if either matches a suspicious parent name,
+          (False, None) if None found.
+    """
     def __init__(self):
         self.known_safe_parents = {
             'systemd', 'sshd', 'Xorg', 'dbus-daemon', 'NetworkManager'
@@ -251,6 +310,54 @@ class ParentProcessValidator:
             return False, None
 
 class BinaryAnalyzer:
+    """
+    Analyzes the characteristics of binaries or running processes and whether to trust them,
+    This uses a variety of heuristics to flag suspicious, obfuscated, or potentially* malicious files.
+
+    Methods:
+    - is_trusted_binary(path):
+        Checks if a given binary meets trust criteria:
+          * Is in system directories (e.g., /usr/bin, /bin, /sbin).
+          * Owned by root.
+          * Not world-writable (to prevent unauthorized modifications).
+          * Recognized by system package manager.
+        Returns (True, reasons) if all checks pass, otherwise (False, reasons) with explanations.
+
+    - is_upx_packed(path):
+        Checks if the binary is packed with UPX (a common packer used for obfuscation).
+        Returns True if UPX-packed, False otherwise. -- dont know how impactful this is.. will have to do more testing.. as in write my own upx packed KeyLogger??
+
+    - is_memory_loaded_or_deleted(pid):
+        Checks if the executable of the given process has been deleted from disk but is still running in memory,
+        which is often seen techniques in malware. -- haven't seen with KeyLoggers, maybe haven't explored enough??
+
+    - check_file_entropy(file_path):
+        Calculates the Shannon entropy of the binary file, which is elevated in highly obfuscated or packed executables.
+
+    - check_packer_magic_bytes(path):
+        Checks the binary header for magic byte sequences of well-known packers (UPX, MPRESS, ASPack, PECompact, etc.).
+        Returns True and the packer name if a signature is found.
+
+    - check_file_authenticity(file_path, full_path, pid=None):
+        Performs in-depth checks to determine if the file is suspicious, using some of above methods:
+          * Whether the binary/executable is in directories that are often used as malware drop zones (/tmp, /dev/shm, /var/tmp, etc.).
+          * If the binary passes is_memory_loaded_or_deleted and `is_trusted_binary` function checks.
+          * Permission and ownership analysis.
+        Returns:
+            (True, reasons, []) if suspicious,
+            (False, [], trusted_reasons) if trusted,
+            with reasons for the decision.
+
+    - check_obfuscated_or_packed_binaries(pid=None):
+        Uses all the helper functions that we have in the class, to find processes that are packed, or memory-deleted or 
+        has high entropy, or display packer signatures-flags potential obfuscation and enables uss to do further checks.
+
+    Example Outputs:
+        - Trusted system binary: True, ["Binary is in a trusted system directory", "Binary is owned by root", ...]
+        - Suspicious binary: False, ["Binary path is not in a trusted directory", "Binary not owned by root", ...]
+        - Packed or obfuscated binary: ['is upx-packed', 'has high-entropy', ...]
+    """
+
     def is_trusted_binary(self, path):
         reasons = []
         try:
@@ -298,12 +405,13 @@ class BinaryAnalyzer:
         except:
             return False
 
-    def is_deleted_on_disk(self, pid):
+    def is_memory_loaded_or_deleted(self, pid):
         try:
             exe_path = os.readlink(f"/proc/{pid}/exe")
-            return "(deleted)" in exe_path
+            return "(deleted)" in exe_path or "memfd:" in exe_path
         except Exception:
             return False
+
 
     def check_file_entropy(self, file_path):
         try:
@@ -357,7 +465,7 @@ class BinaryAnalyzer:
                             return True
                 trusted_reasons.append("No suspicious files or sockets opened by the process")
 
-                if "memfd:" in full_path or "(deleted)" in full_path:
+                if self.is_memory_loaded_or_deleted(pid):
                     reasons.append(f"Executable is memory-loaded or deleted: {full_path}")
                     return True
                 trusted_reasons.append("Executable is loaded from disk (not memory-resident or deleted)")
@@ -443,7 +551,7 @@ class BinaryAnalyzer:
                 if self.is_upx_packed(full_path):
                     reasons.append("is upx-packed")
 
-                if self.is_deleted_on_disk(p_info['pid']):
+                if self.is_memory_loaded_or_deleted(p_info['pid']):
                         reasons.append("is memory-deleted")
 
                 rt, name = self.check_packer_magic_bytes(full_path)
@@ -464,6 +572,22 @@ class BinaryAnalyzer:
             return reasons if reasons else False
 
 class IPCScanner:
+    """
+    Scans for suspicious inter process communication (IPC) channels such as sockets and FIFOs.
+
+    Methods:
+      - detect_suspicious_ipc_channels(ignorable_files=None):
+            Scans the directories /dev/shm, /tmp, and /run for IPC files (UNIX sockets or FIFOs) that:
+                * Are world-readable/writable.
+                * Are owned by root or the current user.
+                * Are not in the provided ignorable_files list.
+            
+            For each IPC file found, it also checks if any processes have that channel opened by checking all process fd's.
+
+            Returns:
+                - A sorted list of suspicious IPC paths.
+                - A dictionary mapping each suspicious IPC path to a set of PIDs that are currently using (have open) that file.
+    """
     def detect_suspicious_ipc_channels(self, ignorable_files=None):
         suspicious_paths = []
         ipc_dirs = ["/dev/shm", "/tmp", "/run"]
@@ -521,6 +645,15 @@ class IPCScanner:
         return sorted(set(suspicious_paths)), socket_usage_map
 
 class FileMonitor:
+    """
+    Monitors a specific process (by PID) for file activity within a given timeout window.
+
+    Method:
+      - check_file_activity(pid, timeout):
+            Watches all currently opened files by the process.
+            Uses inotify to monitor these files for any write, modify, create, or open events.
+            Returns True as soon as file activity (matching the events) is detected, or False if no activity is seen within the timeout set.
+    """
     def check_file_activity(self, pid, timeout):
         processed_paths = set()
         start_time = time.time()
@@ -559,6 +692,29 @@ class FileMonitor:
 
 
 class ModuleChecker:
+    #Initial stages of this project, I for some reason wrote checks for only python KeyLogger's, so these are specific to python processes..
+
+    """
+    Checks whether specific libraries or modules are loaded by a process.
+
+    Methods:
+      - get_modules_using_py_spy():
+            Uses 'py-spy dump' to inspect the modules loaded by a Python process.
+            Returns like this - (found, logs):
+
+      - get_libs_using_mem_maps():
+            Reads /proc/[pid]/maps to check if any specified libraries are memory-mapped into the process.
+            Returns list of found libraries.
+
+      - get_modules_using_lsof():
+            Uses 'lsof' to list all open files by the process, checking if any of the target libraries are open.
+            Returns list of found libraries.
+
+      - get_modules_using_pmap():
+            Uses 'pmap' to enumerate the memory map of the process, searching for target libraries.
+            Returns list of found libraries.
+    """
+
     def __init__(self, pid, libs):
         self.pid = pid
         self.libs = libs
@@ -1555,7 +1711,7 @@ import string
 import threading
 
 def bpf_monitor_with_something(bpf):
-    code = ''.join(choices(string.ascii_uppercase + string.digits, k=5))
+    code = ''.join(choices(string.ascii_letters + string.digits, k=5))
     print(f"\nType this code for more accurate results (or press Enter to skip): {code}")
 
     bpf.start()
@@ -1620,7 +1776,6 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
         for input_pid in input_access_pids:
                log(f"PID {input_pid} -> /dev/input/*", is_log)
     
-
 
     fullpaths = {}
     parent_map = {}
@@ -1773,9 +1928,6 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                     proc = psutil.Process(pid)
                     path = get_path(proc.cwd(), proc.cmdline(), proc.exe())
                     name = proc.name()
-                    # if pid not in input_access_pids or pid not in total_pids:
-                    #     continue
-                    
                     if path:
                         fullpaths[pid] = path
                         if sockets:
@@ -2074,8 +2226,6 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
                 symbol = "╰─" if idx == len(sorted_reasons) - 1 else "├─"
                 print(f" │  {symbol} {reason}")
             print()
-
-
 
     # Monitor part
     elif not scan and not s_pid and printed_pids:
