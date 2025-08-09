@@ -788,6 +788,34 @@ class ModuleChecker:
             return []
 
 class PersistenceChecker:
+    """
+    Checks for evidence of a process being persistent, helps to spot keyloggers, or unwanted autostart behavior.
+
+    Methods:
+      - get_existing_user_homes():
+            Returns a list of user home directory paths (including /root and all subdirs of /home).
+
+      - check_persistence(pid):
+            For a given PID, checks whether its executable path or command appears in:
+              * systemd service definitions (~/.config/systemd/user/*.service)
+              * User desktop autostart entries (~/.config/autostart/*.desktop)
+              * Common shell/profile files (~/.bashrc, ~/.profile, ~/.xinitrc) in user homes
+              * User level crontab
+            Returns (True, evidence message) if found, (False, None) otherwise.
+
+      - check_cron_jobs(is_log=False):
+            Scans different cron configuration files like /etc/cron*, /var/spool/cron/ entries containing
+            suspicious keywords - base64, curl, wget, python, suspicious paths - /tmp/, and obfuscation patterns.
+            Returns (score, suspicious_entries) - the number and details of suspicious cron jobs or scripts found.
+
+      - list_user_rc_files():
+            Lists all shell/init files - .bashrc, .profile, .xinitrc, and system-wide rc/profile scripts
+
+      - check_ld_preload(pid=None, files_to_check=None):
+            Checks for usage of LD_PRELOAD
+            Returns (score, found_pids) indicating if any detected persistence via LD_PRELOAD is present.
+    """
+
     def get_existing_user_homes(self):
         user_homes = []
 
@@ -1015,6 +1043,25 @@ class PersistenceChecker:
         return score, found_pids
 
 class NetworkMonitor:
+    """
+    Monitors network activity of a specific PID, tracking connections and behavior
+    indicative of potential data export, remote C&C, or port forwarding.
+
+    Method:
+      - check_network_activity(input_pid, timeout):
+        Observes the specified process (by PID) over a period (timeout).
+
+        Checks for:
+            - Outbound network connections to public (non-private) IP addresses.
+            - Whether the process is both LISTENing for incoming connections and has an ESTABLISHED outgoing connection,
+
+        Returns:
+            {
+                "outbound_ips": [list of non-private IP addresses the process has established connections to],
+                "port_forwarding": boolean indicating suspected port forwarding/proxying behavior
+            }
+
+    """
     def check_network_activity(self, input_pid, timeout):
         conn_count = defaultdict(int)
         initial_conn = set()
@@ -1079,6 +1126,16 @@ bpf_file = "bpf_output.json"
 or_file = "test.json"
 
 class BPFMONITOR:
+    """
+    Controls and parses a userspace loader that activates an eBPF probe to monitor sensitive device accesses.
+
+    - start(): Launches './loader' binary, which gathers data for a fixed period(timeout).
+    - stop(): terminates the loader binary.
+    - get_device_names_from_bpf_file(): Reads the loader binary output(bpf_output.json) - which has PID, major, minor and 
+      convert the device numbers to its real paths (e.g., /dev/input/event*, /dev/pts/*, /dev/hidraw*), and returns a set of (PID, device_path) pairs.
+    - check_pid(pid): Checks if the given PID is in bpf_output.json file.
+    """
+
     def __init__(self, bpf_file, timeout=5):
             self.proc = None
             self.timeout = timeout
@@ -1197,49 +1254,66 @@ class BPFMONITOR:
             print(f"{e}")
             return False
 
-    def check_device_type(self, pid, keyword, timeout=50):
-        for _ in range(timeout):
-            try:
-                with open(or_file, "r") as f:
-                    for line in f:
-                        try:
-                            entry = json.loads(line)
-                            d_path = entry.get("device_path", "")
-                            if pid == entry.get("pid") and keyword in d_path:
-                                return True,d_path
-                        except Exception as e:
-                            print(f"[WARN] JSON decode error: {e}")
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                print(f"[!] Failed to open file: {e}")
-            time.sleep(1)
-        return False
+    # def check_device_type(self, pid, keyword, timeout=50):
+    #     for _ in range(timeout):
+    #         try:
+    #             with open(or_file, "r") as f:
+    #                 for line in f:
+    #                     try:
+    #                         entry = json.loads(line)
+    #                         d_path = entry.get("device_path", "")
+    #                         if pid == entry.get("pid") and keyword in d_path:
+    #                             return True,d_path
+    #                     except Exception as e:
+    #                         print(f"[WARN] JSON decode error: {e}")
+    #         except FileNotFoundError:
+    #             pass
+    #         except Exception as e:
+    #             print(f"[!] Failed to open file: {e}")
+    #         time.sleep(1)
+    #     return False
 
 
 def get_binary_info(full_path):
+    """
+    Checks if the given binary is recognized by Linux PM.
+    Returns True if found, False otherwise.
+    """
+    pkg_managers = ["apt", "dnf", "yum", "pacman", "zypper", "apk"]
     try:
-        pkg_managers = ["apt", "dnf", "yum", "pacman", "zypper", "apk"]
         for pm in pkg_managers:
             if shutil.which(pm):
-                result = None
                 if pm == "apt":
-                    result = subprocess.run(["dpkg", "-S", full_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    cmd = ["dpkg", "-S", full_path]
                 elif pm in ["dnf", "yum", "zypper"]:
-                    result = subprocess.run(["rpm", "-qf", full_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    cmd = ["rpm", "-qf", full_path]
                 elif pm == "pacman":
-                    result = subprocess.run(["pacman", "-Qo", full_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    cmd = ["pacman", "-Qo", full_path]
                 elif pm == "apk":
-                    result = subprocess.run(["apk", "info", "-W", full_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if result is not None:
-                    return result.returncode == 0
+                    cmd = ["apk", "info", "-W", full_path]
+                else:
+                    continue
+                result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if result.returncode == 0:
+                    return True
         return False
     except Exception:
         return False
 
-
-
 def has_suspicious_modules(binary, lib_scores):
+    """
+    Scans a given binary file for the presence of suspicious modules, libraries,
+    or keywords according to a dictionary of module names to 'suspicion scores'.
+
+    - For script files (.py, .sh, .pl), reads each line of source.
+    - For binaries, runs 'strings' to extract printable text and checks each line.
+    - Uses regex to search for exact keyword/module/library names from lib_scores.
+
+    Example:
+        lib_scores = {'pyxhook':5, 'pynput':4, 'evdev':3, 'socket':2}
+        result = has_suspicious_modules('/tmp/unknown_script.py', lib_scores)
+        # result = {'pyxhook': 5} if pyxhook found in the file.
+    """
     try:
         def lines():
             try:
@@ -1284,8 +1358,21 @@ def has_suspicious_modules(binary, lib_scores):
         return None
 
 
-
 def has_suspicious_strings(binary_path):
+    """
+    Scans the output of 'strings' on a binary for finding suspicious keywords against a list of patterns.
+    
+    Patterns include:
+      - File/device paths commonly used for input events (/dev/input/eventX)
+      - Names of libraries used for X11/synthetic input or event capture
+      - Source/header filenames and function names often found in keylogger code
+      - Keywords/signals typical for keylogging software (keystroke, log_keys, sendinput, etc)
+    
+    Returns:
+        (True, matched_pattern) if any suspicious string found; 
+        otherwise (False, None).
+    """
+
     path_patterns = [
         r"/dev/input/event\d+",
         r"libx11\.so",
@@ -1332,6 +1419,23 @@ def has_suspicious_strings(binary_path):
     return False, None
 
 def get_path(cwd, cmdline, exe_path):
+    """
+    Tries to get the absolute path to executable/script for a process(PID)
+
+    Logic:
+        - If the process is from a known interpreter (python, bash, etc.), 
+          assumes the "main executable" will be the second element of cmdline (cmdline[1]).
+        - Otherwise, it uses the first argument of cmdline.
+        - Checks:
+            * If path is absolute and exists as a file -> returns that.
+            * If cwd is given, checks cwd + path as a file -> returns that.
+            * Otherwise, tries exe_path as a fallback.
+        - If none of these exists, returns False.
+
+    Returns:
+        - Absolute file path if found
+        - False if none found or on error
+    """
     try:
         if not cmdline:
             return False
@@ -1369,6 +1473,12 @@ known_safe_programs = {
 
 
 def get_file_hash(path):
+    """
+    returns the MD5 hash of a file at the given path.
+    - Reads the file in chunks (4KB at a time) to avoid loading large files into memory.
+    - Returns the hash as a hex string.
+    - If file can't be read, prints an error and returns False.
+    """
     try:
         h = hashlib.md5()
         with open(path, 'rb') as f:
@@ -1385,6 +1495,16 @@ def get_file_hash(path):
         return False
 
 def hash_and_save(path, pid, name, score, ist: bool):
+    """
+    Calculates the MD5 hash for a file, then saves process/file details into 'process.json'.
+    - Checks if the file's hash is already present in the JSON (avoids duplicates).
+    - If new, appends a dictionary with: pid, process name, file path, hash, score, and 'is trusted' flag.
+    - Stores and updates the JSON file 'process.json' as a persistent record.
+
+    Returns:
+        True  - if hash saved (or already present)
+        False - on any failure
+    """
     try:
         h = hashlib.md5()
         with open(path, 'rb') as f:
@@ -1426,6 +1546,15 @@ def hash_and_save(path, pid, name, score, ist: bool):
         return False
 
 def check_impersonating_process(pid):
+    """
+    Checks if a process (by PID) is attempting to impersonate key system binaries
+    (e.g. 'systemd', 'bash', 'cron', etc.) but is **not** running from a whitelisted system location.
+
+    Returns:
+        (True, reason) if suspicious impersonation is found;
+        (False, None) otherwise.
+    """
+
     try:
         p = psutil.Process(pid)
         name = p.name()
@@ -1441,6 +1570,17 @@ def check_impersonating_process(pid):
 
 # assuming that a process wont try to hide access to hidraw
 def check_hidraw_connections(pid):
+    """
+    Checks if a process (by PID) has any open file descriptor pointing to a hidraw device.
+
+    Returns:
+        (True, device_path) if a hidraw device is open by the process;
+        (False, None) otherwise.
+
+    Example:
+        # If process 2239 has /dev/hidraw2 open:
+        check_hidraw_connections(2239) → (True, "/dev/hidraw2")
+    """
     try:
         fd_dir = f"/proc/{pid}/fd"
         for fd in os.listdir(fd_dir):
@@ -1483,6 +1623,27 @@ def check_hidraw_connections(pid):
 
 # idea is to find a suspicious input device based on heuristics, - will have to improve in future
 def is_suspicious_input_device():
+    """
+    Scans /dev/input devices to detect potentially suspicious (virtual, recent, or user-created) input devices and 
+    the processes currently accessing them.
+
+    Flags a device as suspicious if:
+      - The device bus type is "virtual"
+      - The device name is blacklisted (commonly abused or emulated names)
+      - Device was created < 1 minute ago
+      - The device is NOT owned by root
+      - It is currently accessed by a process that:
+           * is running from a suspicious path (e.g., in /tmp, /var/tmp, or /dev/shm) or
+           * is recent (like < 10 minutes old), as recently spawned processes may or could be malicious injectors
+
+    Returns:
+      (True, [list of dicts with suspicious device/process/reasons])
+        if any suspicious devices are found,
+      (False, None)
+        if none are detected.
+
+    """
+
     sus_paths = {"/tmp", "/var/tmp", "/dev/shm"}
     context = pyudev.Context()
     suspicious_devices = []
@@ -1618,7 +1779,7 @@ def is_suspicious_input_device():
 
 
 
-# TODO: theory is that a malicious file could run in memory without writing to disk
+# theory is that a malicious file could run in memory without writing to disk
 # we could monitor them using bpf, initial idea is to capture these - memfd_create, execveat
 memfd_out_file = "memfd_create_output.json"
 def run_fileless_execution_loader(timeout=10, binary="./fe_loader", out_file="memfd_create_output.json"):
@@ -1710,7 +1871,15 @@ from random import choices
 import string
 import threading
 
+
+
 def bpf_monitor_with_something(bpf):
+    """
+    Prompts the user to actively type a random code to increase the chance that any running keylogger
+    will capture or react to genuine keyboard input during BPF monitoring.
+
+    Returns True if the user provides any input (whether correct or not), otherwise False.
+    """
     code = ''.join(choices(string.ascii_letters + string.digits, k=5))
     print(f"\nType this code for more accurate results (or press Enter to skip): {code}")
 
@@ -1729,6 +1898,22 @@ def bpf_monitor_with_something(bpf):
 
 
 def scan_process(is_log=False, target_pid=None, scan_all=False):
+    """
+    The main workflow for scanning system processes (--scan option) for suspicious input device access, keylogger behavior. We have two options one for specific PID and for all the processes.
+
+    High-level FLow:
+    - Initializes all analyzers.
+    - Monitors BPF events to detect input devices.
+    - Collects suspicious IPC, device usage, and logs activity.
+    - For the target PID or all running processes:
+        * Gets the reasons for suspicion (input access via /dev/event, hidraw, X11, BPF, IPC, etc).
+        * Tracks full file paths, parent process, and maintains trusted/unrecognized lists.
+        * Applies file authenticity checks, see check_file_authenticity() function.
+        * Hashes and saves info for trusted binaries/processes. -- I forgot to add for Untrusted processes.. will think about it..
+    - At the end, it sends all the details to check_and_report() function.
+
+    """
+
     log("Initializing analyzers", is_log)
     i = InputMonitor()
     input_access_pids = i.get_process_using_input_device()
@@ -1968,6 +2153,10 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
 
 
 def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False, s_pid=False, is_log_enabled=False, trusted_reason_list=None):
+
+    """
+    This juts takes all the data from --scan and --monitor and -p option and perform few more checks to confirm if a process is a KeyLogger and then print them.
+    """
     if trusted_paths and scan and not s_pid:
         print()
         print("\033[1;34m┌" + "─" * 58 + "┐\033[0m")
@@ -2277,6 +2466,20 @@ def pid_is_trusted(pid, hash):
 
 # --monitor option
 def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
+    """
+    Continuously monitors all running processes (--all option would scan all of them, if False, it just skips the process that are trusted in process.json) for suspicious activity. 
+    Same as the --scan option, but goes on indefinitely until ctrl+c'ed or some error.
+
+    Flow:
+      - Gets active input device access using multiple methods.
+      - For each process, gets data (cwd, cmdline, exe, etc.).
+      - Passes these data to r_process(), which performs few checks 
+        (see r_process for details).
+      - If r_process() returns a process suspicious, sends it to phase_two_analysis() 
+        for additional checks or reporting.
+      - Tracks which processes/paths have already been processed to avoid redundant work.
+      - Sleeps for the specified interval before repeating.
+    """
     spinner = itertools.cycle(['-', '\\', '|', '/'])
 
     print(f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} Monitoring Started.")
@@ -2356,6 +2559,21 @@ def change_and_join(reasons):
     return str(reasons)
 
 def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log_enabled=False):
+
+    """
+    Does analysis for a process identified as suspicious
+
+    Flow:
+      - Initializes all analyzers: BPF monitoring, X11 analyzer, binary/file/persistence/network/IPCs.
+      - Gathers additional context or data for the target PID, like suspected reasons, X11 activity, hidraw access, and
+        all processes with input device access.
+      - For each suspicious candidate:
+          * Verifies input device access (via BPF and input_access_pids).
+          * Checks for direct hidraw and X11 device access, then flagging them accordingly.
+          * Runs file authenticity checks against detected suspicious processes.
+          * Tracks paths as trusted or not, gets evidence across analyzers.
+      - Calls check_and_report that does more checks and print if found any KeyLoggers*.
+    """
 
     bpf = BPFMONITOR(bpf_file, 5)
     x = X11Analyzer()
@@ -2444,6 +2662,13 @@ def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log
     )
 
 def prompt_user_trust_a_process():
+    """
+    An option to let the user mark a specific binary (by path) as trusted or untrusted,
+    saving this status for future reference in 'process.json'.
+    
+    Why?
+      - There's a chance that this tool could report false-postivie's, so to avoid them, user can add trust or not trust a process.
+    """
     binary_name = input("> Please Enter the binary path (example: /usr/bin/ls): ").strip()
 
     if not os.path.exists(binary_name):
@@ -2467,26 +2692,28 @@ def prompt_user_trust_a_process():
             if full_path and os.path.samefile(full_path, binary_name):
                 print(f"[*] {binary_name} is currently running with PID: {proc.pid}")
                 if hash_and_save(full_path, proc.pid, binary_name, 0, trust_flag):
-                    print(f"[SUCCESS] {'Trusted' if trust_flag else 'Untrusted'} status set for: {binary_name}")
+                    print(f"[*] {'Trusted' if trust_flag else 'Untrusted'} status set for: {binary_name}")
                 else:
-                    print(f"[FAILED] Could not update trust status for: {binary_name}")
+                    print(f"[!] Could not update trust status for: {binary_name}")
                 found_running = True
                 break
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
         except Exception as e:
-            print(f"[WARN] Error while inspecting a process: {e}")
+            print(f"[!] Error while inspecting a process: {e}")
 
     if not found_running:
         print(f"[*] {binary_name} is not running.")
         if hash_and_save(binary_name, None, binary_name, 0, trust_flag):
-            print(f"[SUCCESS] {'Trusted' if trust_flag else 'Untrusted'} status set for: {binary_name}")
+            print(f"[*] {'Trusted' if trust_flag else 'Untrusted'} status set for: {binary_name}")
         else:
-            print(f"[FAILED] Could not update trust status for: {binary_name}")
+            print(f"[!] Could not update trust status for: {binary_name}")
 
 def intial_system_checks(is_log=False):
+    """
+    Performs basic security checks on the system in hope of finding a KeyLogger.
+    """
     pc = PersistenceChecker()
-    
 
     print("┌" + "─" * 58 + "┐")
     print("│ This option (default) will perform the following checks: │")
