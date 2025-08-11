@@ -37,6 +37,7 @@ Next:
 - Add log, explaining why a process is trusted
 - A blog post, maybe, on why a method is used and giving rationale as to why we are doing certain things to find keyloggers.
 - Will have to revisit the initial stages of creating process.json file and why a process is being trusted.
+- **Harden the entire script, so that one can not bypass the heuristics**
 
 FS:
 - Maybe in way future, implement sandboxing?
