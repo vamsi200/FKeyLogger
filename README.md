@@ -98,3 +98,7 @@ wget -qO- https://raw.githubusercontent.com/vamsi200/FKeyLogger/main/src/setup.s
 - Runs `template_gen.py` which, scans /dev/input, /dev/tty, /dev/pts, and /dev/hidraw* to extract major/minor device numbers and then injects these ranges into vfsread.bpf.c, so that the BPF program only monitors relevant devices on the system.
 - Generates `vmlinux.h` and compiles BPF programs via `make`.
 
+## ⚠ Disclaimer
+This project is designed solely for security auditing and primarly for the detection of malicious software like keyloggers.  
+Running this tool on systems that you do not own or have explicit permission to test may be illegal in your jurisdiction.  
+**The author assumes no liability for misuse.**
