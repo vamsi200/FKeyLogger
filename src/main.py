@@ -1124,14 +1124,14 @@ class NetworkMonitor:
 
 bpf_file = "bpf_output.json"
 or_file = "test.json"
-
+binary = "./vfsread_bin"
 class BPFMONITOR:
     """
     Controls and parses a userspace loader that activates an eBPF probe to monitor sensitive device accesses.
 
-    - start(): Launches './loader' binary, which gathers data for a fixed period(timeout).
-    - stop(): terminates the loader binary.
-    - get_device_names_from_bpf_file(): Reads the loader binary output(bpf_output.json) - which has PID, major, minor and 
+    - start(): Launches 'vfsread_bin' binary, which gathers data for a fixed period(timeout).
+    - stop(): terminates the binary.
+    - get_device_names_from_bpf_file(): Reads the binary output(bpf_output.json) - which has PID, major, minor and 
       convert the device numbers to its real paths (e.g., /dev/input/event*, /dev/pts/*, /dev/hidraw*), and returns a set of (PID, device_path) pairs.
     - check_pid(pid): Checks if the given PID is in bpf_output.json file.
     """
@@ -1143,19 +1143,19 @@ class BPFMONITOR:
             atexit.register(self.stop)
 
     def start(self):
-        if not os.path.exists('./loader'):
-            print("Error: ./loader binary not found in current directory!")
-            return
+        if not os.path.exists(binary):
+            print(f"Error: {binary} binary not found in current directory!")
+            exit(1)
         
-        if not os.access('./loader', os.X_OK):
-            print("Error: ./loader is not executable!")
-            return
+        if not os.access(binary, os.X_OK):
+            print(f"Error: {binary} is not executable!")
+            exit(1)
         
         open(self.bpf_file, "w").close()
         
         try:
             self.proc = subprocess.Popen(
-                ['sudo', './loader'],
+                ['sudo', binary],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
@@ -3227,8 +3227,8 @@ def parse_args():
     return parser.parse_args()
 
 if __name__ == "__main__":
-    require_root()
     args = parse_args()
+    require_root()
     m = BinaryAnalyzer()
     k = BPFMONITOR(bpf_file)
     banner = r"""
