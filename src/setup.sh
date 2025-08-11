@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VENV_DIR="./FKeyLogger/venv"
+VENV_DIR="./FKeyLogger/src/venv"
 BIN_DIR="./bin"
 BPFTOOL_VERSION="v7.5.0"
 BPFTOOL_EXTRACT_DIR="./bpftool_extract"
@@ -106,5 +106,6 @@ fi
 
 printf "\n%-50s\n" "--------------------------------------------------"
 echo "Setup complete."
-echo "Please Activate virtual env: source ./FKeylogger/venv/bin/activate"
+echo "Please login as root - sudo su"
+echo "And Activate virtual env: source ./FKeylogger/src/venv/bin/activate"
 printf "%-50s\n\n" "--------------------------------------------------"
