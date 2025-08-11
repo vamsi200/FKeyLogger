@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VENV_DIR="venv"
+VENV_DIR="./FKeyLogger/venv"
 BIN_DIR="./bin"
 BPFTOOL_VERSION="v7.5.0"
 BPFTOOL_EXTRACT_DIR="./bpftool_extract"
@@ -92,6 +92,7 @@ python3 "$TEMPLATE_GEN" &>/dev/null || {
   exit 1
 }
 
+echo "[+] Getting Header files for BPF tools"
 if "./bin/bpftool" btf dump file /sys/kernel/btf/vmlinux format c >vmlinux.h; then
   echo "[+] Building BPF files using Makefile"
   if ! make >/dev/null; then
@@ -105,5 +106,5 @@ fi
 
 printf "\n%-50s\n" "--------------------------------------------------"
 echo "Setup complete."
-echo "Please Activate virtual env: source venv/bin/activate"
+echo "Please Activate virtual env: source ./FKeylogger/venv/bin/activate"
 printf "%-50s\n\n" "--------------------------------------------------"
