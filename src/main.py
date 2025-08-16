@@ -1502,47 +1502,69 @@ def get_file_hash(path):
 
 def hash_and_save(path, pid, name, score, ist: bool):
     """
-    Calculates the MD5 hash for a file, then saves process/file details into 'process.json'.
-    - Checks if the file's hash is already present in the JSON (avoids duplicates).
-    - If new, appends a dictionary with: pid, process name, file path, hash, score, and 'is trusted' flag.
-    - Stores and updates the JSON file 'process.json' as a persistent record.
-
-    Returns:
-        True  - if hash saved (or already present)
-        False - on any failure
+    MD5 the file and upsert into process.json keyed by *path*.
+    - If 'path' already exists in JSON: update its 'is trusted' (and refresh md5/pid/score/name).
+    - If not present: append a new entry.
+    - We do NOT skip just because another entry has the same md5.
     """
     try:
+        norm_path = os.path.realpath(path)
+
         h = hashlib.md5()
-        with open(path, 'rb') as f:
-            while True:
-                data = f.read(4096)
-                if not data:
-                    break
+        with open(norm_path, 'rb') as f:
+            while True: 
+                data = f.read(4096) 
+                if not data: 
+                    break 
                 h.update(data)
         file_hash = h.hexdigest()
-        entry = {
-            "pid": str(pid),
+
+        entry_new = {
+            "pid": str(pid) if pid is not None else "",
             "name": name,
-            "path": path,
+            "path": norm_path,
             "md5 hash": file_hash,
             "score": str(score),
-            "is trusted": ist 
+            "is trusted": bool(ist)
         }
 
         file_path = "process.json"
+
         if os.path.exists(file_path):
-            with open(file_path, "r") as f:
-                try:
+            try:
+                with open(file_path, "r") as f:
                     data = json.load(f)
-                except json.JSONDecodeError:
+                if not isinstance(data, list):
                     data = []
+            except json.JSONDecodeError:
+                data = []
         else:
             data = []
 
-        if any(e.get("md5 hash") == file_hash for e in data):
-            return True
+        idx = None
+        for i, e in enumerate(data):
+            p = e.get("path")
+            try:
+                if p and os.path.realpath(p) == norm_path:
+                    idx = i
+                    break
+            except Exception:
+                if p == norm_path:
+                    idx = i
+                    break
 
-        data.append(entry)
+        if idx is not None:
+            existing = data[idx]
+            existing["is trusted"] = bool(ist)
+            existing["pid"] = str(pid) if pid is not None else existing.get("pid", "")
+            existing["name"] = name if name is not None else existing.get("name", "")
+            existing["score"] = str(score)
+            existing["md5 hash"] = file_hash
+            existing["path"] = norm_path
+            data[idx] = existing
+        else:
+            data.append(entry_new)
+
         with open(file_path, "w") as f:
             json.dump(data, f, indent=4)
         return True
@@ -2093,11 +2115,10 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                                         for treason in trusted_reasons_list:
                                             trusted_reasons_by_pid[pid].add(treason)
                                     else:
-                                        if pid in suspicious_candidates or (len(reason_list) >= 1 and not (len(reason_list) == 1 and "not in a trusted" in reason_list[0])):
-                                            unrecognized_paths.add(path)
-                                            suspicious_pids.add(pid)
-                                            for reason in reason_list:
-                                                reasons_by_pid[pid].add(reason)
+                                        unrecognized_paths.add(path)
+                                        suspicious_pids.add(pid)
+                                        for reason in reason_list:
+                                            reasons_by_pid[pid].add(reason)
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         log(f"Skipping PID {pid} (process unavailable)", is_log)
                         continue
@@ -2137,12 +2158,14 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
             
                 if not scan_all and path:
                     file_hash = get_file_hash(path)
-                    proceed = not pid_is_trusted(pid, file_hash)
+                    proceed = pid_is_trusted(pid, file_hash)
                     hash_flag = True
                 else:
-                    proceed = True
+                    proceed = False
                     hash_flag = False
+                
                 proceed_map[pid] = proceed
+
                 hash_flag_map[pid] = hash_flag
                 if bpf.check_pid(pid):
                     reasons_by_pid[pid].add("Accessing Input Devices confirmed using - BPF")
@@ -2159,11 +2182,13 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                     reasons_by_pid[pid].add("Has input access through X11")
                     if is_log:
                         messages.append(f"PID {pid}: X11 access activity detected")
+
             if messages:
                 log("PIDs with direct input/X11 access:", True)
                 for i, msg in enumerate(messages):
                     prefix = "└─" if i == len(messages) - 1 else "├─"
                     print(f"    {prefix} {msg}")
+
             if bpf_check_pid and is_log:
                 matches = bpf.check_device_type(bpf_check_pid)
                 if matches:
@@ -2173,6 +2198,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                         if device_name:
                             prefix = "└─" if i == len(matches) - 1 else "├─"
                             print(f"    {prefix} {pid:<6} -> {device_name}")
+
             for input_pid in input_access_pids:
                 suspicious_candidates.add(input_pid)
                 total_pids.add(input_pid)
@@ -2183,38 +2209,44 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                     proc = psutil.Process(pid)
                     path = get_path(proc.cwd(), proc.cmdline(), proc.exe())
                     name = proc.name()
+                    proceed = proceed_map.get(pid, False)
                     if path:
                         fullpaths[pid] = path
-                        if sockets:
-                            for file in sockets:
-                                result, reason_list, trusted_reasons_list = ba.check_file_authenticity(file, path, pid)
-                                if not result:
-                                    trusted_paths.add(path)
-                                    proceed = proceed_map.get(pid, True)
-                                    hash_flag = hash_flag_map.get(pid, False)
-                                    if proceed:
+                        if not proceed:
+                            if sockets:
+                                for file in sockets:
+                                    result, reason_list, trusted_reasons_list = ba.check_file_authenticity(file, path, pid)
+                                    if not result:
+                                        trusted_paths.add(path)
+                                        hash_flag = hash_flag_map.get(pid, False)
+                                        if pid not in input_access_pids or pid in total_pids:
+                                            continue
                                         if not hash_and_save(path, pid, name, 0, hash_flag):
                                             print(f"[!] Failed to update {path}")
-                                    for treason in trusted_reasons_list:
-                                        trusted_reasons_by_pid[pid].add(treason)
-                                else:
-                                    if target_pid in suspicious_candidates or (len(reason_list) >= 1 and not (len(reason_list) == 1 and "not in a trusted" in reason_list[0])):
+                                        for treason in trusted_reasons_list:
+                                            trusted_reasons_by_pid[pid].add(treason)
+                                    else:
                                         unrecognized_paths.add(path)
                                         suspicious_pids.add(pid)
                                         for reason in reason_list:
                                                 reasons_by_pid[pid].add(reason)
+                        if proceed:
+                            trusted_paths.add(path)
+
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     log(f"Skipping PID {pid} (process unavailable)", is_log)
                     continue
             for sp in suspicious_pids:
                 log(f"Reporting phase started for suspicious PID's {sp}", is_log)
+ 
             check_and_report(
-                fullpaths, trusted_paths, unrecognized_paths,
-                suspicious_pids, reasons_by_pid, parent_map,
-                ba, fm, pc, nm,
-                scan=True, s_pid=False, is_log_enabled=is_log,
-                trusted_reason_list=trusted_reasons_by_pid
+            fullpaths, trusted_paths, unrecognized_paths,
+            suspicious_pids, reasons_by_pid, parent_map,
+            ba, fm, pc, nm,
+            scan=True, s_pid=False, is_log_enabled=is_log,
+            trusted_reason_list=trusted_reasons_by_pid
             )
+   
     except KeyboardInterrupt:
         print("\n[*] Scan interrupted by user. Exiting...")
 
@@ -2225,34 +2257,48 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
     """
     This juts takes all the data from --scan and --monitor and -p option and perform few more checks to confirm if a process is a KeyLogger and then print them.
     """
+
     if trusted_paths and scan and not s_pid:
         print()
-        print("\033[1;34m┌" + "─" * 58 + "┐\033[0m")
-        print("\033[1;34m│" + "Trusted Processes Using Input Devices".center(58) + "│\033[0m")
-        print("\033[1;34m└" + "─" * 58 + "┘\033[0m")
+        header = log("Trusted Processes Using Input Devices", True)
 
         trusted_list = sorted(set(trusted_paths))
-        for idx, path in enumerate(trusted_list, 1):
+        max_len = max(
+            len(header),
+            max((len(f"  {path:<40} (System)") for path in trusted_list), default=0)
+        )
+
+        print(f"\033[1;90m{'-' * max_len}\033[0m")
+
+        for path in trusted_list:
             group = "System" if path.startswith("/usr") else "User"
-            symbol = "╰─" if idx == len(trusted_list) else "├─"
-            print(f" {symbol} {path} (\033[1;36m{group}\033[0m)")
+            line = f"  {path:<40} (\033[1;36m{group}\033[0m)"
+            print(line)
+        print(f"\033[1;90m{'-' * max_len}\033[0m")
+
+
 
     if unrecognized_paths and scan and not s_pid:
         print()
-        print("\033[1;34m┌" + "─" * 58 + "┐\033[0m")
-        print("\033[1;34m│" + "Unrecognized Processes Using Input Devices".center(58) + "│\033[0m")
-        print("\033[1;34m└" + "─" * 58 + "┘\033[0m")
+        header = log("Unrecognized Processes Using Input Devices", True)
 
         unrec_list = sorted(set(unrecognized_paths))
-        for idx, path in enumerate(unrec_list, 1):
-            symbol = "╰─" if idx == len(unrec_list) else "├─"
-            print(f" {symbol} {path}")
+        max_len = max(
+            len(header),
+            max((len(f"  {path:<40}") for path in unrec_list), default=0)
+        )
+
+
+        print(f"\033[1;90m{'-' * max_len}\033[0m")
+
+        for path in unrec_list:
+            print(f"  {path}")
+
+        print(f"\033[1;90m{'-' * max_len}\033[0m")
 
     if suspicious_pids and scan and not s_pid:
         print()
-        print("\033[1;34m┌" + "─" * 58 + "┐\033[0m")
-        print("\033[1;34m│" + "Running Checks on Unrecognized Processes".center(58) + "│\033[0m")
-        print("\033[1;34m└" + "─" * 58 + "┘\033[0m")
+        header = log("Running Checks on Unrecognized Processes", True)
 
         checks = [
             "Process has any suspicious strings",
@@ -2260,12 +2306,17 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             "Process has opened any foreign connections",
             "Process is persistent"
         ]
+        max_len = max(
+            len(header),
+            max((len(f"  {c}") for c in checks), default=0)
+        )
 
-        for idx, c in enumerate(checks, 1):
-            symbol = "╰─" if idx == len(checks) else "├─"
-            print(f" {symbol} {c}")
+        print(f"\033[1;90m{'-' * max_len}\033[0m")
 
-    
+        for c in checks:
+            print(f"  {c}")
+        print(f"\033[1;90m{'-' * max_len}\033[0m")
+
     pa = ParentProcessValidator()
     for pid in list(suspicious_pids):
         messages = []
@@ -2300,11 +2351,11 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             reasons_by_pid[pid].add("possible port forwarding behavior detected")
             messages.append("Possible port forwarding behavior detected")
 
-            if path:
-                rt, string_name = has_suspicious_strings(path)
-                if rt and string_name:
-                    reasons_by_pid[pid].add(f"has suspicious strings: {string_name}")
-                    messages.append(f"Suspicious strings found - {string_name}")
+        if path:
+            rt, string_name = has_suspicious_strings(path)
+            if rt and string_name:
+                reasons_by_pid[pid].add(f"has suspicious strings: {string_name}")
+                messages.append(f"Suspicious strings found - {string_name}")
 
         rt, p_output = pa.get_sus_parent_process(pid)
         if rt and p_output:
@@ -2537,10 +2588,12 @@ def pid_is_trusted(pid, hash):
     except (json.JSONDecodeError, FileNotFoundError):
         return False
     
-    for entry in data:
-        if entry.get("pid") == str(pid) or entry.get("md5 hash") == str(hash) and entry.get("is trusted") is True:
-            return True
-
+    pid, hash = str(pid), str(hash)
+    return any(
+        (entry.get("pid") == pid or entry.get("md5 hash") == hash)
+        and entry.get("is trusted") is True
+        for entry in data
+    )
 
 
 # --monitor option
@@ -2610,7 +2663,7 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
             else:
                 proceed = True
                 hash_flag = False
-
+            
             if proceed:
                 output = r_process(pid, cwd, cmdline, exe, fd, terminal, username, uptime)
 
@@ -2628,7 +2681,7 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
                         if not hash_and_save(p, pid, name, 0, hash_flag):
                             print(f"[!] Failed to update {file_path}")
 
-        print(f"\n{datetime.now().strftime('%H:%M:%S]')} Sleeping - {interval}s")
+        print(f"\n{datetime.now().strftime('[%H:%M:%S]')} Sleeping - {interval}s")
         time.sleep(interval)
 
 def change_and_join(reasons):
@@ -3289,7 +3342,7 @@ def log(msg, is_log_enabled):
     if is_log_enabled:
         timestamp = datetime.now().strftime("[%H:%M:%S]")
         print(f"{timestamp} {msg}")
-
+    return msg
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Keylogger Detector that may work") 
@@ -3348,4 +3401,6 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
     else:
-        intial_system_checks(args.log)
+        output = pid_is_trusted(123, "2fbd9a2edfb94fba8ef4c2008c54c0a2")
+        print(output)
+        # intial_system_checks(args.log)
