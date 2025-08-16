@@ -104,8 +104,20 @@ else
   exit 1
 fi
 
-printf "\n%-50s\n" "--------------------------------------------------"
-echo "Setup complete."
-echo "Please login as root - sudo su"
-echo "And Activate virtual env: source ./FKeylogger/src/venv/bin/activate"
-printf "%-50s\n\n" "--------------------------------------------------"
+printf "\n%-60s\n" "============================================================"
+echo "                      Setup Complete"
+printf "%-60s\n" "============================================================"
+
+echo
+echo "Next steps:"
+echo
+echo "  1. Login as root:"
+echo "       sudo su"
+echo
+echo "  2. Activate the virtual environment:"
+echo "       source ./FKeylogger/src/venv/bin/activate"
+echo
+echo "  3. Run the program (default option recommended for first use):"
+echo "       python3 main.py"
+echo
+printf "%-60s\n\n" "============================================================"
