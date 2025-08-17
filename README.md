@@ -66,19 +66,19 @@
 ## Usage
 
 ```bash
-usage: main.py [-h] [-p P] [--scan] [--monitor] [--modify_trust] [--log] [--all]
+usage: main.py [-h] [-p P] [--scan] [--monitor] [--interval INTERVAL] [--modify_trust] [--log] [--all]
 
 Keylogger Detector that may work
 
 options:
-  -h, --help      show this help message and exit
-  -p P            -p takes an pid for Analyzing
-  --scan          Scan Mode
-  --monitor       Monitor Mode
-  --modify_trust  Modifies/Adds trust to a process
-  --log           Enable verbose logging
-  --all           By default, trusted processes (based on heuristics or user input) are skipped. Use this flag to disable that
-                  behavior and scan all processes, including the trusted ones.
+  -h, --help           show this help message and exit
+  -p P                 -p takes an pid for Analyzing
+  --scan               Scan Mode
+  --monitor            Monitor Mode
+  --interval INTERVAL  Monitor interval in seconds (default: 10s)
+  --modify_trust       Modifies/Adds trust to a process
+  --log                Enable verbose logging
+  --all                By default, trusted processes (based on heuristics or user input) are skipped. Use this flag to disable that behavior and scan all processes, including the trusted ones.
 ```
 ## Setup
 
