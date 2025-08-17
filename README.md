@@ -89,7 +89,7 @@ Please make sure to source the venv as root or manually install dependencies int
 wget -qO- https://raw.githubusercontent.com/vamsi200/FKeyLogger/main/src/setup.sh | bash
 ```
 
-### What this script does
+### What this script does - [Link](https://raw.githubusercontent.com/vamsi200/FKeyLogger/main/src/setup.sh)
 - Clones the repository from GitHub.
 - Detects system architecture (x86_64, arm64) and downloads the correct `bpftool` binary from - https://github.com/libbpf/bpftool/releases/.
 - Verifies checksum of the downloaded binary.
