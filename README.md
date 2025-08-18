@@ -66,19 +66,19 @@
 ## Usage
 
 ```bash
-usage: main.py [-h] [-p P] [--scan] [--monitor] [--modify_trust] [--log] [--all]
+usage: main.py [-h] [-p P] [--scan] [--monitor] [--interval INTERVAL] [--modify_trust] [--log] [--all]
 
 Keylogger Detector that may work
 
 options:
-  -h, --help      show this help message and exit
-  -p P            -p takes an pid for Analyzing
-  --scan          Scan Mode
-  --monitor       Monitor Mode
-  --modify_trust  Modifies/Adds trust to a process
-  --log           Enable verbose logging
-  --all           By default, trusted processes (based on heuristics or user input) are skipped. Use this flag to disable that
-                  behavior and scan all processes, including the trusted ones.
+  -h, --help           show this help message and exit
+  -p P                 -p takes an pid for Analyzing
+  --scan               Scan Mode
+  --monitor            Monitor Mode
+  --interval INTERVAL  Monitor interval in seconds (default: 10s)
+  --modify_trust       Modifies/Adds trust to a process
+  --log                Enable verbose logging
+  --all                By default, trusted processes (based on heuristics or user input) are skipped. Use this flag to disable that behavior and scan all processes, including the trusted ones.
 ```
 ## Setup
 
@@ -89,7 +89,7 @@ Please make sure to source the venv as root or manually install dependencies int
 wget -qO- https://raw.githubusercontent.com/vamsi200/FKeyLogger/main/src/setup.sh | bash
 ```
 
-### What this script does
+### What this script does - [Link](https://raw.githubusercontent.com/vamsi200/FKeyLogger/main/src/setup.sh)
 - Clones the repository from GitHub.
 - Detects system architecture (x86_64, arm64) and downloads the correct `bpftool` binary from - https://github.com/libbpf/bpftool/releases/.
 - Verifies checksum of the downloaded binary.
@@ -99,6 +99,6 @@ wget -qO- https://raw.githubusercontent.com/vamsi200/FKeyLogger/main/src/setup.s
 - Generates `vmlinux.h` and compiles BPF programs via `make`.
 
 ## ⚠ Disclaimer
-This project is designed solely for security auditing and primarly for the detection of malicious software like keyloggers.  
-Running this tool on systems that you do not own or have explicit permission to test may be illegal in your jurisdiction.  
+- This project is designed solely for security auditing and primarly for the detection of malicious software like keyloggers.  
+- Running this tool on systems that you do not own or have explicit permission to test may be illegal in your jurisdiction.  
 **The author assumes no liability for misuse.**
