@@ -1502,69 +1502,47 @@ def get_file_hash(path):
 
 def hash_and_save(path, pid, name, score, ist: bool):
     """
-    MD5 the file and upsert into process.json keyed by *path*.
-    - If 'path' already exists in JSON: update its 'is trusted' (and refresh md5/pid/score/name).
-    - If not present: append a new entry.
-    - We do NOT skip just because another entry has the same md5.
+    Calculates the MD5 hash for a file, then saves process/file details into 'process.json'.
+    - Checks if the file's hash is already present in the JSON (avoids duplicates).
+    - If new, appends a dictionary with: pid, process name, file path, hash, score, and 'is trusted' flag.
+    - Stores and updates the JSON file 'process.json' as a persistent record.
+
+    Returns:
+        True  - if hash saved (or already present)
+        False - on any failure
     """
     try:
-        norm_path = os.path.realpath(path)
-
         h = hashlib.md5()
-        with open(norm_path, 'rb') as f:
-            while True: 
-                data = f.read(4096) 
-                if not data: 
-                    break 
+        with open(path, 'rb') as f:
+            while True:
+                data = f.read(4096)
+                if not data:
+                    break
                 h.update(data)
         file_hash = h.hexdigest()
-
-        entry_new = {
-            "pid": str(pid) if pid is not None else "",
+        entry = {
+            "pid": str(pid),
             "name": name,
-            "path": norm_path,
+            "path": path,
             "md5 hash": file_hash,
             "score": str(score),
-            "is trusted": bool(ist)
+            "is trusted": ist 
         }
 
         file_path = "process.json"
-
         if os.path.exists(file_path):
-            try:
-                with open(file_path, "r") as f:
+            with open(file_path, "r") as f:
+                try:
                     data = json.load(f)
-                if not isinstance(data, list):
+                except json.JSONDecodeError:
                     data = []
-            except json.JSONDecodeError:
-                data = []
         else:
             data = []
 
-        idx = None
-        for i, e in enumerate(data):
-            p = e.get("path")
-            try:
-                if p and os.path.realpath(p) == norm_path:
-                    idx = i
-                    break
-            except Exception:
-                if p == norm_path:
-                    idx = i
-                    break
+        if any(e.get("md5 hash") == file_hash for e in data):
+            return True
 
-        if idx is not None:
-            existing = data[idx]
-            existing["is trusted"] = bool(ist)
-            existing["pid"] = str(pid) if pid is not None else existing.get("pid", "")
-            existing["name"] = name if name is not None else existing.get("name", "")
-            existing["score"] = str(score)
-            existing["md5 hash"] = file_hash
-            existing["path"] = norm_path
-            data[idx] = existing
-        else:
-            data.append(entry_new)
-
+        data.append(entry)
         with open(file_path, "w") as f:
             json.dump(data, f, indent=4)
         return True
@@ -1908,7 +1886,7 @@ def bpf_monitor_with_something(bpf):
 
     Returns True if the user provides any input (whether correct or not), otherwise False.
     """
-    code = ''.join(choices(string.ascii_letters + string.digits, k=5))
+    code = ''.join(choices(string.ascii_letters, k=5))
     print(f"\nType this code for more accurate results (or press Enter to skip): {code}")
 
     bpf.start()
@@ -1923,7 +1901,6 @@ def bpf_monitor_with_something(bpf):
         return True
     else:
         return False
-
 
 def scan_process(is_log=False, target_pid=None, scan_all=False):
     """
@@ -1942,7 +1919,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
 
     """
 
-    log("Initializing analyzers", is_log)
+    log("Initializing analyzers", True)
     i = InputMonitor()
     input_access_pids = i.get_process_using_input_device()
     bpf = BPFMONITOR(bpf_file, 5)
@@ -1955,27 +1932,27 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
     
     messages = []
 
-    log("Scanning Started.", True)
-    log("Getting Process details.", True)
-
     if scan_all:
         log("Scanning all processes, including those marked as trusted.", True)
     else:
         log("Skipping processes trusted by program heuristics or user configuration.", True)
 
-    log(f"Starting monitoring using BPF for {bpf.timeout} seconds", is_log)
+    mem_timeout = 5
+    log("Scanning Started..", True)
+
+    log(f"Starting '/dev/input/' monitoring using BPF for {bpf.timeout} seconds", True)
     captcha_result = bpf_monitor_with_something(bpf)
 
     if not captcha_result:
         bpf.start()
         time.sleep(bpf.timeout)
-    
+
+    if is_log:
+        print()
+        log("BPF monitoring stopped.", True)
+
     print()
-    log("BPF monitoring stopped.", is_log)
-   
-    
-    mem_timeout = 5
-    log(f"Starting memory monitoring using BPF for {mem_timeout} seconds", is_log)
+    log(f"Starting memory monitoring using BPF for {mem_timeout} seconds", True)
     run_fileless_execution_loader(mem_timeout)
     log(f"Memory Monitoring stopped", is_log)
 
@@ -2003,8 +1980,6 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
             prefix = "└─" if i == len(input_access_pids) - 1 else "├─"
             print(f"    {prefix} {input_pid:<6} -> /dev/input/*")
 
-
-    
 
     fullpaths = {}
     parent_map = {}
@@ -2122,9 +2097,11 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         log(f"Skipping PID {pid} (process unavailable)", is_log)
                         continue
-                
-                for sp in suspicious_pids:
-                    log(f"Reporting phase started for suspicious PID's {sp}", is_log)
+               
+                if suspicious_pids:
+                    print()
+                    print(f"{datetime.now().strftime('[%H:%M:%S]')} Reporting phase started for PID - {target_pid}")
+
             else:
                 print("[*] Exiting..")
                 exit(0)
@@ -2141,6 +2118,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                 sys.stdout.write(f"\033[1G")
                 sys.stdout.write(f"\033[1G{datetime.now().strftime('[%H:%M:%S]')} Scanning PID - {pid:<6} ({index}) {next(spinner)}")
                 sys.stdout.flush()
+                
                 try:
                     cwd = proc.cwd()
                     cmdline = proc.cmdline()
@@ -2153,20 +2131,21 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                         sys.stdout.write("\n")
                         log(f"Skipped PID {pid} (could not access CWD/cmdline/exe)", True)
                     continue
+
                 confidence, access_rate = x.check_x11_connection(pid)
                 is_using_hidraw, hidraw_name = check_hidraw_connections(pid)
             
                 if not scan_all and path:
                     file_hash = get_file_hash(path)
-                    proceed = pid_is_trusted(pid, file_hash)
+                    proceed = not pid_is_trusted(pid, file_hash)
                     hash_flag = True
                 else:
-                    proceed = False
+                    proceed = True
                     hash_flag = False
-                
-                proceed_map[pid] = proceed
 
+                proceed_map[pid] = proceed
                 hash_flag_map[pid] = hash_flag
+
                 if bpf.check_pid(pid):
                     reasons_by_pid[pid].add("Accessing Input Devices confirmed using - BPF")
                     bpf_check_pid.append(pid)
@@ -2209,44 +2188,41 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                     proc = psutil.Process(pid)
                     path = get_path(proc.cwd(), proc.cmdline(), proc.exe())
                     name = proc.name()
-                    proceed = proceed_map.get(pid, False)
+
                     if path:
                         fullpaths[pid] = path
-                        if not proceed:
-                            if sockets:
-                                for file in sockets:
-                                    result, reason_list, trusted_reasons_list = ba.check_file_authenticity(file, path, pid)
-                                    if not result:
-                                        trusted_paths.add(path)
-                                        hash_flag = hash_flag_map.get(pid, False)
-                                        if pid not in input_access_pids or pid in total_pids:
-                                            continue
+                        if sockets:
+                            for file in sockets:
+                                result, reason_list, trusted_reasons_list = ba.check_file_authenticity(file, path, pid)
+                                if not result:
+                                    trusted_paths.add(path)
+                                    proceed = proceed_map.get(pid, True)
+                                    hash_flag = hash_flag_map.get(pid, False)
+                                    if proceed:
                                         if not hash_and_save(path, pid, name, 0, hash_flag):
                                             print(f"[!] Failed to update {path}")
-                                        for treason in trusted_reasons_list:
-                                            trusted_reasons_by_pid[pid].add(treason)
-                                    else:
-                                        unrecognized_paths.add(path)
-                                        suspicious_pids.add(pid)
-                                        for reason in reason_list:
-                                                reasons_by_pid[pid].add(reason)
-                        if proceed:
-                            trusted_paths.add(path)
-
+                                    for treason in trusted_reasons_list:
+                                        trusted_reasons_by_pid[pid].add(treason)
+                                else:
+                                    unrecognized_paths.add(path)
+                                    suspicious_pids.add(pid)
+                                    for reason in reason_list:
+                                            reasons_by_pid[pid].add(reason)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     log(f"Skipping PID {pid} (process unavailable)", is_log)
                     continue
-            for sp in suspicious_pids:
-                log(f"Reporting phase started for suspicious PID's {sp}", is_log)
- 
+            
+            if suspicious_pids:
+                print()
+                print(f"{datetime.now().strftime('[%H:%M:%S]')} Reporting phase started for suspicious PID's")
+
             check_and_report(
-            fullpaths, trusted_paths, unrecognized_paths,
-            suspicious_pids, reasons_by_pid, parent_map,
-            ba, fm, pc, nm,
-            scan=True, s_pid=False, is_log_enabled=is_log,
-            trusted_reason_list=trusted_reasons_by_pid
+                fullpaths, trusted_paths, unrecognized_paths,
+                suspicious_pids, reasons_by_pid, parent_map,
+                ba, fm, pc, nm,
+                scan=True, s_pid=False, is_log_enabled=is_log,
+                trusted_reason_list=trusted_reasons_by_pid
             )
-   
     except KeyboardInterrupt:
         print("\n[*] Scan interrupted by user. Exiting...")
 
@@ -2261,16 +2237,16 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
     if trusted_paths and scan and not s_pid:
         print()
         header = log("Trusted Processes Using Input Devices", True)
+        new_len = len(header) + 11
 
-        trusted_list = sorted(set(trusted_paths))
         max_len = max(
-            len(header),
-            max((len(f"  {path:<40} (System)") for path in trusted_list), default=0)
+            new_len,
+            max((len(f"  {path:<40} (System)") for path in trusted_paths), default=0)
         )
 
         print(f"\033[1;90m{'-' * max_len}\033[0m")
 
-        for path in trusted_list:
+        for path in trusted_paths:
             group = "System" if path.startswith("/usr") else "User"
             line = f"  {path:<40} (\033[1;36m{group}\033[0m)"
             print(line)
@@ -2281,17 +2257,16 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
     if unrecognized_paths and scan and not s_pid:
         print()
         header = log("Unrecognized Processes Using Input Devices", True)
+        new_len = len(header) + 11
 
-        unrec_list = sorted(set(unrecognized_paths))
         max_len = max(
-            len(header),
-            max((len(f"  {path:<40}") for path in unrec_list), default=0)
+            new_len,
+            max((len(f"  {path}") for path in unrecognized_paths), default=0)
         )
-
-
+       
         print(f"\033[1;90m{'-' * max_len}\033[0m")
 
-        for path in unrec_list:
+        for path in unrecognized_paths:
             print(f"  {path}")
 
         print(f"\033[1;90m{'-' * max_len}\033[0m")
@@ -2306,8 +2281,9 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             "Process has opened any foreign connections",
             "Process is persistent"
         ]
+        new_len = len(header) + 11
         max_len = max(
-            len(header),
+            new_len,
             max((len(f"  {c}") for c in checks), default=0)
         )
 
@@ -2351,11 +2327,11 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             reasons_by_pid[pid].add("possible port forwarding behavior detected")
             messages.append("Possible port forwarding behavior detected")
 
-        if path:
-            rt, string_name = has_suspicious_strings(path)
-            if rt and string_name:
-                reasons_by_pid[pid].add(f"has suspicious strings: {string_name}")
-                messages.append(f"Suspicious strings found - {string_name}")
+            if path:
+                rt, string_name = has_suspicious_strings(path)
+                if rt and string_name:
+                    reasons_by_pid[pid].add(f"has suspicious strings: {string_name}")
+                    messages.append(f"Suspicious strings found - {string_name}")
 
         rt, p_output = pa.get_sus_parent_process(pid)
         if rt and p_output:
@@ -2588,12 +2564,10 @@ def pid_is_trusted(pid, hash):
     except (json.JSONDecodeError, FileNotFoundError):
         return False
     
-    pid, hash = str(pid), str(hash)
-    return any(
-        (entry.get("pid") == pid or entry.get("md5 hash") == hash)
-        and entry.get("is trusted") is True
-        for entry in data
-    )
+    for entry in data:
+        if entry.get("pid") == str(pid) or entry.get("md5 hash") == str(hash) and entry.get("is trusted") is True:
+            return True
+
 
 
 # --monitor option
@@ -2663,7 +2637,7 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
             else:
                 proceed = True
                 hash_flag = False
-            
+
             if proceed:
                 output = r_process(pid, cwd, cmdline, exe, fd, terminal, username, uptime)
 
@@ -3401,6 +3375,5 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
     else:
-        output = pid_is_trusted(123, "2fbd9a2edfb94fba8ef4c2008c54c0a2")
-        print(output)
-        # intial_system_checks(args.log)
+        intial_system_checks(args.log)
+
