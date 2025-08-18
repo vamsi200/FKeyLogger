@@ -2590,10 +2590,12 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
       - Tracks which processes/paths have already been processed to avoid redundant work.
       - Sleeps for the specified interval before repeating.
     """
+
     if scan_all:
         log(f"Scanning all processes, including those marked as trusted.", True)
     else:
         log(f"Skipping processes trusted by program heuristics or user configuration.", True)
+    
 
     log(f"Monitoring Started.", True)
     log(f"Scan interval - {interval}s", True)
@@ -3326,12 +3328,18 @@ def log(msg, is_log_enabled):
         print(f"{timestamp} {msg}")
     return msg
 
+def positive_interval(value):
+    ivalue = int(value)
+    if ivalue < 0:
+        raise argparse.ArgumentTypeError(f"{value} is invalid, must be > 0")
+    return ivalue
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Keylogger Detector that may work") 
     parser.add_argument('-p', type=int, help="-p takes an pid for Analyzing")
     parser.add_argument("--scan", action="store_true", help="Scan Mode")
     parser.add_argument("--monitor", action="store_true", help="Monitor Mode")
-    parser.add_argument("--interval", type=int, default=10, help="Monitor interval in seconds (default: 10s)")
+    parser.add_argument("--interval", type=positive_interval, default=10, help="Monitor interval in seconds (default: 10s)")
     parser.add_argument("--modify_trust", action="store_true", help="Modifies/Adds trust to a process")
     parser.add_argument("--log", action="store_true", help="Enable verbose logging")
     parser.add_argument(
