@@ -1156,13 +1156,14 @@ class BPFMONITOR:
         
         try:
             self.proc = subprocess.Popen(
-                ['sudo', binary],
+                [binary],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
             self._timer = threading.Timer(self.timeout, self.stop)
             self._timer.daemon = True
             self._timer.start()
+            return self.proc.pid
             
         except Exception as e:
             print(f"Failed to start BPF binary: {e}")
@@ -1792,7 +1793,7 @@ def run_fileless_execution_loader(timeout=5, binary="./fe_loader", out_file="mem
     open(out_file, "w").close()
 
     p = subprocess.Popen(
-        ["sudo", binary],
+        [binary],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         preexec_fn=os.setsid
@@ -2137,10 +2138,10 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
             
                 if not scan_all and path:
                     file_hash = get_file_hash(path)
-                    proceed = not pid_is_trusted(pid, file_hash)
+                    proceed = pid_is_trusted(pid, file_hash)
                     hash_flag = True
                 else:
-                    proceed = True
+                    proceed = False
                     hash_flag = False
 
                 proceed_map[pid] = proceed
@@ -2188,44 +2189,47 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                     proc = psutil.Process(pid)
                     path = get_path(proc.cwd(), proc.cmdline(), proc.exe())
                     name = proc.name()
-
+                    proceed = proceed_map.get(pid, False)
                     if path:
                         fullpaths[pid] = path
-                        if sockets:
-                            for file in sockets:
-                                result, reason_list, trusted_reasons_list = ba.check_file_authenticity(file, path, pid)
-                                if not result:
-                                    trusted_paths.add(path)
-                                    proceed = proceed_map.get(pid, True)
-                                    hash_flag = hash_flag_map.get(pid, False)
-                                    if proceed:
+                        if not proceed:
+                            if sockets:
+                                for file in sockets:
+                                    result, reason_list, trusted_reasons_list = ba.check_file_authenticity(file, path, pid)
+                                    if not result:
+                                        trusted_paths.add(path)
+                                        hash_flag = hash_flag_map.get(pid, False)
+                                        if pid not in input_access_pids or pid in total_pids:
+                                            continue
                                         if not hash_and_save(path, pid, name, 0, hash_flag):
                                             print(f"[!] Failed to update {path}")
-                                    for treason in trusted_reasons_list:
-                                        trusted_reasons_by_pid[pid].add(treason)
-                                else:
-                                    unrecognized_paths.add(path)
-                                    suspicious_pids.add(pid)
-                                    for reason in reason_list:
-                                            reasons_by_pid[pid].add(reason)
+                                        for treason in trusted_reasons_list:
+                                            trusted_reasons_by_pid[pid].add(treason)
+                                    else:
+                                        unrecognized_paths.add(path)
+                                        suspicious_pids.add(pid)
+                                        for reason in reason_list:
+                                                reasons_by_pid[pid].add(reason)
+                        if proceed:
+                            trusted_paths.add(path)
+
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     log(f"Skipping PID {pid} (process unavailable)", is_log)
                     continue
-            
+
             if suspicious_pids:
-                print()
-                print(f"{datetime.now().strftime('[%H:%M:%S]')} Reporting phase started for suspicious PID's")
+                    print()
+                    print(f"{datetime.now().strftime('[%H:%M:%S]')} Reporting phase started for suspicious PID's")
 
             check_and_report(
-                fullpaths, trusted_paths, unrecognized_paths,
-                suspicious_pids, reasons_by_pid, parent_map,
-                ba, fm, pc, nm,
-                scan=True, s_pid=False, is_log_enabled=is_log,
-                trusted_reason_list=trusted_reasons_by_pid
+            fullpaths, trusted_paths, unrecognized_paths,
+            suspicious_pids, reasons_by_pid, parent_map,
+            ba, fm, pc, nm,
+            scan=True, s_pid=False, is_log_enabled=is_log,
+            trusted_reason_list=trusted_reasons_by_pid
             )
     except KeyboardInterrupt:
         print("\n[*] Scan interrupted by user. Exiting...")
-
 
 
 def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False, s_pid=False, is_log_enabled=False, trusted_reason_list=None):
@@ -2586,16 +2590,15 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
       - Tracks which processes/paths have already been processed to avoid redundant work.
       - Sleeps for the specified interval before repeating.
     """
-
-    log(f"Monitoring Started.", True)
-    log(f"Scan interval - {interval}s", True)
-    log(f"Monitoring processes for suspicious activity.", True)
-
     if scan_all:
         log(f"Scanning all processes, including those marked as trusted.", True)
     else:
         log(f"Skipping processes trusted by program heuristics or user configuration.", True)
-   
+
+    log(f"Monitoring Started.", True)
+    log(f"Scan interval - {interval}s", True)
+
+    log(f"Monitoring processes for suspicious activity.", True)
     path_check = set()
     pid_check = set()
 
@@ -2603,9 +2606,11 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
         i = InputMonitor()
         input_access_pids = i.get_process_using_input_device()
         parent_map = {}
-        bpf = BPFMONITOR(bpf_file, 5)
-        bpf.start()
-        bpf.stop()
+        bpf = BPFMONITOR(bpf_file, interval)
+
+        log(f"Starting '/dev/input/' monitoring using BPF for {bpf.timeout} seconds", is_log_enabled)
+        bpf_pid = bpf.start()
+
         for index, proc in enumerate(psutil.process_iter(['pid', 'cmdline', 'exe', 'cwd'])):
             pid = proc.info['pid']
             try:
@@ -2625,6 +2630,9 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
             if not p or skip_current_pid(p, pid):
                 continue
             
+            if pid == bpf_pid:
+                continue
+
             sys.stdout.write(f"\033[1G")
             sys.stdout.write(f"\033[1G{datetime.now().strftime('[%H:%M:%S]')} Scanning PID - {pid:<6} ({index}) {next(spinner)}")
             sys.stdout.flush()
@@ -3337,8 +3345,8 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     require_root()
-    m = BinaryAnalyzer()
     k = BPFMONITOR(bpf_file)
+    
     banner = r"""
     ▄████████    ▄█   ▄█▄    ▄████████ ▄██   ▄    ▄█        ▄██████▄     ▄██████▄     ▄██████▄     ▄████████    ▄████████      
     ███    ███   ███ ▄███▀   ███    ███ ███   ██▄ ███       ███    ███   ███    ███   ███    ███   ███    ███   ███    ███      
@@ -3350,7 +3358,6 @@ if __name__ == "__main__":
     ███          ███   ▀█▀   ██████████  ▀█████▀  █████▄▄██  ▀██████▀    ████████▀    ████████▀    ██████████   ███    ███      
                 ▀                                ▀                                                             ███    ███  
     """
-
     print("\033[1;31m" + banner + "\033[0m")
 
     if args.scan:
@@ -3358,22 +3365,26 @@ if __name__ == "__main__":
             scan_process(args.log, None, args.all)
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
+            k.stop()
     elif args.monitor:
         try:
             monitor_process(args.interval, args.log, args.all)
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
+            k.stop()
+
     elif args.p:
         try:
             scan_process(args.log, args.p, args.all)
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
+            k.stop()
 
     elif args.modify_trust:
         try:
             prompt_user_trust_a_process()
         except KeyboardInterrupt:
             print("\n[*] Scan interrupted by user. Exiting...")
+            k.stop()
     else:
         intial_system_checks(args.log)
-
