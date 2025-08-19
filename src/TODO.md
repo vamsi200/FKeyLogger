@@ -32,7 +32,9 @@
 - Need to add the part of creating process.json file for scan_process() function.
 - Fix the parent process thing.. - working as expected, may have to refine it??
 
-Next: 
+Next:
+- Add instruction in readme to download libbpf and update the setup script
+- Improve Performance
 - Add log option to reasons for more verbose reasoning
 - Add log, explaining why a process is trusted
 - A blog post, maybe, on why a method is used and giving rationale as to why we are doing certain things to find keyloggers.
