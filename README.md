@@ -82,6 +82,24 @@ options:
 ```
 ## Setup
 
+### Prerequisites
+
+Before running the setup script, please ensure the following dependencies are installed on your system:
+
+- **Clang + LLVM**
+- **Make + GCC**
+- **Python 3 + venv**
+- **libbpf**
+
+#### Arch Linux
+```bash
+sudo pacman -Sy base-devel clang llvm libbpf
+```
+#### Debian/Ubuntu
+```bash
+sudo apt install build-essential clang llvm libbpf-dev linux-headers-$(uname -r)
+```
+
 > **Note:**  
 Please make sure to source the venv as root or manually install dependencies into root’s Python environment.
 
@@ -97,6 +115,7 @@ wget -qO- https://raw.githubusercontent.com/vamsi200/FKeyLogger/main/src/setup.s
 - Downloads Python requirements and installs them into a new virtual environment (`venv`).
 - Runs `template_gen.py` which, scans /dev/input, /dev/tty, /dev/pts, and /dev/hidraw* to extract major/minor device numbers and then injects these ranges into vfsread.bpf.c, so that the BPF program only monitors relevant devices on the system.
 - Generates `vmlinux.h` and compiles BPF programs via `make`.
+
 
 ## ⚠ Disclaimer
 - This project is designed solely for security auditing and primarly for the detection of malicious software like keyloggers.  
