@@ -1790,7 +1790,7 @@ def is_suspicious_input_device():
 # theory is that a malicious file could run in memory without writing to disk
 # we could monitor them using bpf, initial idea is to capture these - memfd_create, execveat
 memfd_out_file = "memfd_create_output.json"
-def run_fileless_execution_loader(timeout=5, binary="./fe_loader", out_file="memfd_create_output.json"):
+def run_fileless_execution_loader(timeout=5, binary="./memfd_bin", out_file="memfd_create_output.json"):
     open(out_file, "w").close()
 
     p = subprocess.Popen(
@@ -1983,6 +1983,8 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
             prefix = "└─" if i == len(input_access_pids) - 1 else "├─"
             print(f"    {prefix} {input_pid:<6} -> /dev/input/*")
 
+
+    #TODO: Have to think about more ways of finding processes that are accessing input, this alone I suppose wont be enough
 
     fullpaths = {}
     parent_map = {}
