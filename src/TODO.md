@@ -32,11 +32,13 @@
 - Need to add the part of creating process.json file for scan_process() function.
 - Fix the parent process thing.. - working as expected, may have to refine it??
 - Add instruction in readme to download libbpf - Done 
+- update the setup script -> add the fe_loader binary - Done
 
 Next:
+- Update the MakeFile with the new name
+- modify the template_gen script
 - > so I did some testing on other systems, there are multiple false positives(as expected), so need to improve the whitelisting process and others to reduce these false positives
 
-- update the setup script -> add the fe_loader binary
 - Improve Performance
 - Improve the default option
 - Add log option to reasons for more verbose reasoning
