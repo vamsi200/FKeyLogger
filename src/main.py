@@ -1126,12 +1126,12 @@ class NetworkMonitor:
 
 bpf_file = "bpf_output.json"
 or_file = "test.json"
-binary = "./vfsread_bin"
+binary = "./input_monitor_bin"
 class BPFMONITOR:
     """
     Controls and parses a userspace loader that activates an eBPF probe to monitor sensitive device accesses.
 
-    - start(): Launches 'vfsread_bin' binary, which gathers data for a fixed period(timeout).
+    - start(): Launches 'input_monitor_bin' binary, which gathers data for a fixed period(timeout).
     - stop(): terminates the binary.
     - get_device_names_from_bpf_file(): Reads the binary output(bpf_output.json) - which has PID, major, minor and
       convert the device numbers to its real paths (e.g., /dev/input/event*, /dev/pts/*, /dev/hidraw*), and returns a set of (PID, device_path) pairs.
@@ -1473,11 +1473,6 @@ def get_path(cwd, cmdline, exe_path):
         return False
 
 
-known_safe_programs = {
-    "/usr/bin/systemd", "/usr/bin/dbus-daemon", "/usr/bin/NetworkManager",
-    "/usr/sbin/sshd", "/usr/sbin/crond", "/usr/bin/gnome-shell",
-    "/usr/bin/Xorg", "/usr/bin/Xwayland"
-}
 
 
 def get_file_hash(path):
@@ -1832,6 +1827,12 @@ def read_memfd_events(out_file=memfd_out_file):
         pass
     return pids
 
+known_safe_programs = {
+    "/usr/bin/systemd", "/usr/bin/dbus-daemon", "/usr/bin/NetworkManager",
+    "/usr/sbin/sshd", "/usr/sbin/crond", "/usr/bin/gnome-shell",
+    "/usr/bin/Xorg", "/usr/bin/Xwayland"
+}
+
 def r_process(pid, cwd, cmdline, exe_path,fd, terminal, user, uptime):
     try:
         sus_score = 0
@@ -1839,8 +1840,6 @@ def r_process(pid, cwd, cmdline, exe_path,fd, terminal, user, uptime):
         full_path = get_path(cwd, cmdline, exe_path)
         check = False
         pv = ParentProcessValidator()
-        if not full_path or skip_current_pid(full_path, pid):
-            return False
 
         if not terminal:
             sus_score += 1

@@ -1,15 +1,15 @@
-#include "vfsread.skel.h"
+#include "input_monitor.skel.h"
 #include <bpf/libbpf.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
 #include <unistd.h>
 
 struct event_t {
   uint32_t pid;
   uint32_t minor;
   uint32_t major;
+  char type[];
 };
 
 static FILE *fptr = NULL;
@@ -21,29 +21,29 @@ static void handle_event(void *ctx, int cpu, void *data, unsigned int data_sz) {
   if (!fptr)
     return;
 
-  fprintf(fptr, "{\"pid\": %u, \"major\": %u, \"minor\": %u}\n", ev->pid,
-          ev->major, ev->minor);
+  fprintf(fptr, "{\"pid\": %u, \"major\": %u, \"minor\": %u, \"type\": %s}\n",
+          ev->pid, ev->major, ev->minor, ev->type);
 }
 
 static void handle_signal(int sig) { running = 0; }
 
 int main() {
-  struct vfsread_bpf *skel = vfsread_bpf__open_and_load();
+  struct input_monitor_bpf *skel = input_monitor_bpf__open_and_load();
   if (!skel) {
     fprintf(stderr, "Failed to open and load BPF program\n");
     return 1;
   }
 
-  if (vfsread_bpf__attach(skel)) {
+  if (input_monitor_bpf__attach(skel)) {
     fprintf(stderr, "Failed to attach BPF program\n");
-    vfsread_bpf__destroy(skel);
+    input_monitor_bpf__destroy(skel);
     return 1;
   }
 
   fptr = fopen("bpf_output.json", "a");
   if (!fptr) {
     perror("fopen");
-    vfsread_bpf__destroy(skel);
+    input_monitor_bpf__destroy(skel);
     return 1;
   }
 
@@ -57,7 +57,7 @@ int main() {
   if (!pb) {
     fprintf(stderr, "Failed to create perf buffer\n");
     fclose(fptr);
-    vfsread_bpf__destroy(skel);
+    input_monitor_bpf__destroy(skel);
     return 1;
   }
 
@@ -75,7 +75,7 @@ int main() {
   }
 
   perf_buffer__free(pb);
-  vfsread_bpf__destroy(skel);
+  input_monitor_bpf__destroy(skel);
 
   if (fptr) {
     fclose(fptr);

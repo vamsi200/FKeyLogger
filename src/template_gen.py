@@ -17,6 +17,7 @@ def get_major_minor_from_dev(path):
 def iter_paths(paths=["/dev/input", "/dev/tty", "/dev/pts"]):
     output = []
     paths.extend(glob.glob("/dev/hidraw*"))
+    paths.extend(glob.glob("/dev/uinput*"))
     for p in paths:
         if not os.path.exists(p):
             continue
@@ -52,7 +53,7 @@ def group_minor_values(minors):
 # returns major value and its corresponding minor values like 12[3,4,53] 4[0,5]..
 def generate_mm():
     out = iter_paths()
-    paths_to_check = ["/dev/input", "/dev/tty", "/dev/pts", "/dev/hidraw"]
+    paths_to_check = ["/dev/input", "/dev/tty", "/dev/pts", "/dev/hidraw", "/dev/uinput"]
     values = []
     for p in out:
         for path in paths_to_check:
@@ -76,12 +77,12 @@ def generate_condition(grouped):
     return " || \\\n    ".join(conds)
 
 
-def inject_into_bpf(bpf_file="vfsread.bpf.c"):
+def inject_into_bpf(bpf_file="input_monitor.bpf.c"):
     grouped = generate_mm()
     condition_block = generate_condition(grouped)
 
-    new_code = f"""\
-  // __AUTOGEN_DEVICE_FILTER__
+    vfs_read_code = f"""\
+  // __AUTOGEN_DEVICE_FILTER__VFS__READ
   if (
     {condition_block}
   ) {{
@@ -91,9 +92,24 @@ def inject_into_bpf(bpf_file="vfsread.bpf.c"):
         .major = major,
         .minor = minor,
     }};
+    __builtin_memcpy(ev.type, "vfs_read", sizeof("vfs_read"));
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &ev, sizeof(ev));
   }}
-  return 0;
+"""
+    vfs_write_code = f"""\
+  // __AUTOGEN_DEVICE_FILTER__VFS__WRITE
+  if (
+    {condition_block}
+  ) {{
+    bpf_map_update_elem(&seen_pids, &pid, &dummy, BPF_ANY);
+    struct event_t ev = {{
+        .pid = pid,
+        .major = major,
+        .minor = minor,
+    }};
+    __builtin_memcpy(ev.type, "vfs_write", sizeof("vfs_write"));
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &ev, sizeof(ev));
+  }}
 """
     with open(bpf_file, 'r') as f:
         lines = f.readlines()
@@ -101,8 +117,28 @@ def inject_into_bpf(bpf_file="vfsread.bpf.c"):
     new_lines = []
     in_autogen = False
     for line in lines:
-        if '// __AUTOGEN_DEVICE_FILTER__' in line:
-            new_lines.append(new_code)
+        if '// __AUTOGEN_DEVICE_FILTER__VFS__READ' in line:
+            new_lines.append(vfs_read_code)
+            in_autogen = True
+            continue
+        if in_autogen:
+            if 'return 0;' in line or line.strip() == '}':
+                in_autogen = False
+            continue
+        new_lines.append(line)
+
+    with open(bpf_file, 'w') as f:
+        f.writelines(new_lines)
+
+
+    with open(bpf_file, 'r') as f:
+        lines = f.readlines()
+
+    new_lines = []
+    in_autogen = False
+    for line in lines:
+        if '// __AUTOGEN_DEVICE_FILTER__VFS__WRITE' in line:
+            new_lines.append(vfs_write_code)
             in_autogen = True
             continue
         if in_autogen:
