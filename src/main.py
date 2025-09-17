@@ -30,7 +30,7 @@ spinner = itertools.cycle(['-', '\\', '|', '/'])
 CURRENT_SCRIPT_PATH = os.path.realpath(sys.argv[0])
 CURRENT_PID = os.getpid()
 DETECTED_PROCESSES = set()
-total_pids = set()
+TOTAL_PIDS = set()
 
 white_list_paths = [
     "/usr/bin/",
@@ -91,7 +91,7 @@ def require_root():
 def load_sus_libraries():
     file_path = "libraries.json"
     with open(file_path, 'r') as f:
-        return json.load(f)
+        return json.loads(f.read())
 
 
 # this only works if a process reads inputs directly from the events
@@ -1249,7 +1249,6 @@ class BPFMONITOR:
                         if pid == entry.get("pid") and entry.get("pid") != str(CURRENT_PID):
                             return True
                     except Exception as e:
-                        print(f"{e}")
                         return False
         except FileNotFoundError:
             return False
@@ -1530,7 +1529,7 @@ def hash_and_save(path, pid, name, score, ist: bool):
         if os.path.exists(file_path):
             with open(file_path, "r") as f:
                 try:
-                    data = json.load(f)
+                    data = json.loads(f.read())
                 except json.JSONDecodeError:
                     data = []
         else:
@@ -1957,6 +1956,8 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
     log(f"Starting memory monitoring using BPF for {mem_timeout} seconds", True)
     run_fileless_execution_loader(mem_timeout)
     log(f"Memory Monitoring stopped", is_log)
+    
+    mem_fd_pids = read_memfd_events()
 
     sockets, _ = ipc.detect_suspicious_ipc_channels()
     if sockets and is_log:
@@ -2047,13 +2048,13 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
 
                 if is_using_hidraw:
                     suspicious_candidates.add(pid)
-                    total_pids.add(pid)
+                    TOTAL_PIDS.add(pid)
                     reasons_by_pid[pid].add("Has direct hidraw access")
                     if is_log:
                         messages.append(f"PID {pid}: has direct access to {hidraw_name}")
 
                 if confidence >= 3 and access_rate > 0:
-                    total_pids.add(pid)
+                    TOTAL_PIDS.add(pid)
                     suspicious_candidates.add(pid)
                     reasons_by_pid[pid].add("Has input access through X11")
                     if is_log:
@@ -2077,8 +2078,14 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
 
                 if target_pid in input_access_pids:
                     suspicious_candidates.add(target_pid)
-                    total_pids.add(target_pid)
+                    TOTAL_PIDS.add(target_pid)
                     reasons_by_pid[target_pid].add("Has direct input access")
+
+                if mem_fd_pids:
+                    if target_pid in mem_fd_pids:
+                        suspicious_candidates.add(target_pid)
+                        TOTAL_PIDS.add(target_pid)
+                        reasons_by_pid[target_pid].add("Is running from memory")
 
                 for pid in suspicious_candidates:
                     try:
@@ -2166,12 +2173,12 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                     bpf_check_pid.append(pid)
                 if is_using_hidraw:
                     suspicious_candidates.add(pid)
-                    total_pids.add(pid)
+                    TOTAL_PIDS.add(pid)
                     reasons_by_pid[pid].add("Has direct hidraw access")
                     if is_log:
                         messages.append(f"PID {pid}: has direct access to {hidraw_name}")
                 if confidence >= 3 and access_rate > 0:
-                    total_pids.add(pid)
+                    TOTAL_PIDS.add(pid)
                     suspicious_candidates.add(pid)
                     reasons_by_pid[pid].add("Has input access through X11")
                     if is_log:
@@ -2195,8 +2202,14 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
 
             for input_pid in input_access_pids:
                 suspicious_candidates.add(input_pid)
-                total_pids.add(input_pid)
+                TOTAL_PIDS.add(input_pid)
                 reasons_by_pid[input_pid].add("Has direct input access")
+
+            if mem_fd_pids:
+                if target_pid in mem_fd_pids:
+                    suspicious_candidates.add(target_pid)
+                    TOTAL_PIDS.add(target_pid)
+                    reasons_by_pid[target_pid].add("Is running from memory")
 
             for pid in suspicious_candidates:
                 try:
@@ -2213,7 +2226,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                                     if not result:
                                         trusted_paths.add(path)
                                         hash_flag = hash_flag_map.get(pid, False)
-                                        if pid not in input_access_pids or pid in total_pids:
+                                        if pid not in input_access_pids or pid in TOTAL_PIDS:
                                             continue
                                         if not hash_and_save(path, pid, name, 0, hash_flag):
                                             print(f"[!] Failed to update {path}")
@@ -2577,7 +2590,7 @@ def pid_is_trusted(pid, hash):
         return False
     try:
         with open(file_path, 'r') as f:
-            data = json.load(f)
+            data = json.loads(f.read())
     except (json.JSONDecodeError, FileNotFoundError):
         return False
 
@@ -2706,7 +2719,7 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
 
             if confidence >= 3 and access_rate > 0:
                 suspicious_candidates.add(pid)
-                total_pids.add(pid)
+                TOTAL_PIDS.add(pid)
                 reasons_by_pid[pid].add("Has input access through X11")
                 if is_log_enabled:
                     print()
@@ -2716,7 +2729,7 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
 
             if is_using_hidraw:
                 suspicious_candidates.add(pid)
-                total_pids.add(pid)
+                TOTAL_PIDS.add(pid)
                 reasons_by_pid[pid].add("Has direct hidraw access")
                 if is_log_enabled:
                     print()
@@ -2768,7 +2781,7 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
                                 if not result:
                                     trusted_paths.add(path)
                                     hash_flag = hash_flag_map.get(pid, False)
-                                    if pid not in input_access_pids or pid in total_pids:
+                                    if pid not in input_access_pids or pid in TOTAL_PIDS:
                                         continue
                                     if not hash_and_save(path, pid, name, 0, hash_flag):
                                         print(f"[!] Failed to update {path}")
@@ -2845,7 +2858,7 @@ def change_and_join(reasons):
 #     confidence, access_rate = x.check_x11_connection(pid)
 #     if confidence >= 3 and access_rate > 0:
 #         suspicious_candidates.add(pid)
-#         total_pids.add(pid)
+#         TOTAL_PIDS.add(pid)
 #         reasons_by_pid[pid].add("Has input access through X11")
 #         log(f"PID {pid}: X11 access activity detected", is_log_enabled)
 #
@@ -2853,7 +2866,7 @@ def change_and_join(reasons):
 #
 #     if is_using_hidraw:
 #         suspicious_candidates.add(pid)
-#         total_pids.add(pid)
+#         TOTAL_PIDS.add(pid)
 #         reasons_by_pid[pid].add("Has direct hidraw access")
 #         log(f"PID - {pid} -> has direct access to {hidraw_name}", is_log_enabled)
 #
@@ -2911,11 +2924,11 @@ def change_and_join(reasons):
 
 def prompt_user_trust_a_process():
     """
-    An option to let the user mark a specific binary (by path) as trusted or untrusted,
+    an option to let the user mark a specific binary (by path) as trusted or untrusted,
     saving this status for future reference in 'process.json'.
 
-    Why?
-      - There's a chance that this tool could report false-postivie's, so to avoid them, user can add trust or not trust a process.
+    why?
+      - there's a chance that this tool could report false-postivie's, so to avoid them, user can add trust or not trust a process.
     """
     binary_name = input("> Please Enter the binary path (example: /usr/bin/ls): ").strip()
 
@@ -3466,7 +3479,7 @@ def positive_interval(value):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Keylogger Detector that may work")
-    parser.add_argument('-p', type=int, help="-p takes an pid for Analyzing")
+    parser.add_argument('--p', type=positive_interval, help="-p takes an pid for Analyzing")
     parser.add_argument("--scan", action="store_true", help="Scan Mode")
     parser.add_argument("--monitor", action="store_true", help="Monitor Mode")
     parser.add_argument("--interval", type=positive_interval, default=10, help="Monitor interval in seconds (default: 10s)")
@@ -3484,7 +3497,6 @@ if __name__ == "__main__":
     args = parse_args()
     require_root()
     k = BPFMONITOR(bpf_file)
-    x=X11Analyzer()
 
     banner = r"""
     ▄████████    ▄█   ▄█▄    ▄████████ ▄██   ▄    ▄█        ▄██████▄     ▄██████▄     ▄██████▄     ▄████████    ▄████████
