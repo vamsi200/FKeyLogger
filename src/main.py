@@ -490,6 +490,7 @@ class BinaryAnalyzer:
                 if full_path.startswith(("/usr", "/bin", "/sbin")) and st.st_uid != 0:
                     reasons.append(f"System binary not owned by root: {full_path}")
                     return True
+
                 if full_path.startswith(("/usr", "/bin", "/sbin")) and st.st_uid == 0:
                     trusted_reasons.append("System binary is owned by root (expected)")
 
@@ -2125,6 +2126,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
             proceed_map = {}
             hash_flag_map = {}
             bpf_check_pid = []
+            false_positives = set()
             for index, proc in enumerate(psutil.process_iter(['pid', 'cmdline', 'exe', 'cwd'])):
                 pid = proc.info['pid']
 
@@ -2139,6 +2141,8 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                     name = proc.name()
                     parent_map[proc.pid] = proc.ppid()
                     path = get_path(cwd, cmdline, exe)
+                    
+
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     if is_log:
                         sys.stdout.write("\n")
@@ -2218,6 +2222,13 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                     name = proc.name()
                     proceed = proceed_map.get(pid, False)
                     if path:
+                        if verify_process(pid, path):
+                            false_positives.add((pid, path))
+                            if is_log:
+                                log(f"Skipping {pid} -> {path}\n", True)
+                            continue
+
+                    if path:
                         fullpaths[pid] = path
                         if not proceed:
                             if sockets:
@@ -2251,13 +2262,13 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
             suspicious_pids, reasons_by_pid, parent_map,
             ba, fm, pc, nm,
             scan=True, s_pid=False, is_log_enabled=is_log,
-            trusted_reason_list=trusted_reasons_by_pid
+            trusted_reason_list=trusted_reasons_by_pid, false_positives=false_positives
             )
     except KeyboardInterrupt:
         print("\n[*] Scan interrupted by user. Exiting...")
 
-
-def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False, s_pid=False, is_log_enabled=False, trusted_reason_list=None):
+last_reported = set()
+def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pids, reasons_by_pid, parent_map, ba, fm, pc, nm, scan=False, s_pid=False, is_log_enabled=False, trusted_reason_list=None, false_positives=None):
     messages = []
     """
     This juts takes all the data from --scan and --monitor and -p option and perform few more checks to confirm if a process is a KeyLogger and then print them.
@@ -2533,6 +2544,14 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
         print("\n" + "-" * 50)
         print(" No suspicious keylogger activity found. ".center(50))
         print("-" * 50)
+        
+        if false_positives:
+            print()
+            print(f"\n[Note] Some processes with input access are trusted and skipped:")
+            for pid, path in false_positives:
+                print(f" →> PID: {pid:<6} Path: {path}")
+            print("  (Trusted by package manager, flagged as potential false positives)")
+
 
     if is_log_enabled and trusted_reason_list:
         for pid, reasons in trusted_reason_list.items():
@@ -2582,7 +2601,19 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
 
             print(f" (Investigate or kill with:  kill {pid})\n")
             print()
+    
 
+    elif not scan and not s_pid and not printed_pids:
+        if false_positives:
+            global last_reported
+            new_false_positives = false_positives - last_reported
+            if new_false_positives:
+                print()
+                print("\n[Note] Some processes with input access are trusted and skipped:")
+                for pid, path in new_false_positives:
+                    print(f"  →> PID: {pid:<6} Path: {path}")
+                print("  (Trusted by package manager, flagged as potential false positives)")
+                last_reported |= new_false_positives
 
 file_path = "process.json"
 def pid_is_trusted(pid, hash):
@@ -2635,6 +2666,7 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
     ipc = IPCScanner()
     nm = NetworkMonitor()
     sockets = ipc.detect_suspicious_ipc_channels()
+    false_positives = set()
 
     """
     Continuously monitors all running processes (--all option would scan all of them, if False, it just skips the process that are trusted in process.json) for suspicious activity.
@@ -2661,9 +2693,9 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
     log(f"Scan interval - {interval}s", True)
 
     log("Monitoring processes for suspicious activity.", True)
-    pid_check = set()
     proceed_map = {}
     hash_flag_map = {}
+    false_positives = set()
 
     while True:
         i = InputMonitor()
@@ -2758,17 +2790,11 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
                 path = get_path(proc.cwd(), proc.cmdline(), proc.exe())
                 name = proc.name()
 
-                if pid in pid_check:
+                if verify_process(pid, path):
+                    false_positives.add((pid, path))
                     if is_log_enabled:
                         log(f"Skipping {pid} -> {path}\n", True)
                     continue
-
-                pid_check.add(pid)
-
-                if verify_process(pid, path):
-                    if is_log_enabled:
-                        log(f"Skipping {pid} -> {path}\n", True)
-                        continue
 
                 proceed = proceed_map.get(pid, False)
 
@@ -2808,7 +2834,7 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
         pc,
         nm,
         scan=False,
-        is_log_enabled=is_log_enabled,
+        is_log_enabled=is_log_enabled, false_positives=false_positives
     )
         print(f"\n{datetime.now().strftime('[%H:%M:%S]')} Sleeping - {interval}s")
         time.sleep(interval)
