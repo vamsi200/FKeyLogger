@@ -108,16 +108,11 @@ printf "\n%-60s\n" "============================================================
 echo "                      Setup Complete"
 printf "%-60s\n" "============================================================"
 
-echo
-echo "Next steps:"
-echo
-echo "  1. Login as root:"
-echo "       sudo su"
-echo
-echo "  2. Activate the virtual environment:"
-echo "       source ./FKeylogger/src/venv/bin/activate"
-echo
-echo "  3. Run the program (default option recommended for first use):"
-echo "       python3 main.py"
-echo
-printf "%-60s\n\n" "============================================================"
+printf "\nNext steps:\n\n"
+
+printf "  %-3s %-36s %s\n" "1." "Login as root:" "sudo su"
+printf "  %-3s %-36s %s\n" "2." "cd into FKeylogger:" "cd FKeylogger/src/"
+printf "  %-3s %-36s %s\n" "3." "Activate the virtual environment:" "source ./venv/bin/activate"
+printf "  %-3s %-36s %s\n" "4." "Run the program (default option recommended for first use):" "python3 main.py"
+
+printf "\n%60s\n\n" "============================================================"
