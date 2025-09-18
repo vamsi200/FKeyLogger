@@ -724,19 +724,22 @@ class ModuleChecker:
 
     def get_modules_using_py_spy(self):
         logs = []
-        result = subprocess.run(["py-spy", "dump", "--pid", str(self.pid)],
+
+        try:
+            result = subprocess.run(["py-spy", "dump", "--pid", str(self.pid)],
                                 capture_output=True, text=True)
-        if result.returncode == 0:
-            found = False
-            for line in result.stdout.splitlines():
-                for mod in self.libs:
-                    if mod in line:
-                        logs.append(mod)
-                        found = True
-            return found, logs
-        else:
-            logs.append(f"[py-spy] Failed to attach to PID {self.pid}")
-            return False, logs
+            if result.returncode == 0:
+                found = False
+                for line in result.stdout.splitlines():
+                    for mod in self.libs:
+                        if mod in line:
+                            logs.append(mod)
+                            found = True
+                return found, logs
+            else:
+                return False, logs
+        except Exception:
+             return False, logs
 
     def get_libs_using_mem_maps(self):
         found_libs = []
@@ -748,7 +751,6 @@ class ModuleChecker:
                         found_libs.append(mod)
             return found_libs
         except (FileNotFoundError, PermissionError):
-            print("Error: Failed to read maps")
             return []
 
     def get_modules_using_lsof(self):
@@ -768,7 +770,6 @@ class ModuleChecker:
                             found_libs.append(lib)
             return found_libs
         except Exception:
-            print("Error: Failed to check output using lsof")
             return []
 
     def get_modules_using_pmap(self):
@@ -787,7 +788,6 @@ class ModuleChecker:
                             found_libs.append(lib)
             return found_libs
         except Exception:
-            print("Error: Failed to check output using pmap")
             return []
 
 class PersistenceChecker:
@@ -1785,31 +1785,19 @@ def is_suspicious_input_device():
 # theory is that a malicious file could run in memory without writing to disk
 # we could monitor them using bpf, initial idea is to capture these - memfd_create, execveat
 memfd_out_file = "memfd_create_output.json"
-def run_fileless_execution_loader(timeout=5, binary="./memfd_bin", out_file="memfd_create_output.json"):
-    open(out_file, "w").close()
-
+def run_fileless_execution_loader(timeout=5, binary="./memfd_bin"):
     p = subprocess.Popen(
         [binary],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        preexec_fn=os.setsid
+        preexec_fn=os.setsid  # new process group, so children die too
     )
-
-    def terminate():
-        try:
-            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-        except Exception:
-            pass
-    atexit.register(terminate)
 
     try:
         p.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-        except Exception:
-            pass
-
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        p.wait() 
 
 def read_memfd_events(out_file=memfd_out_file):
     pids = []
@@ -1826,6 +1814,7 @@ def read_memfd_events(out_file=memfd_out_file):
     except FileNotFoundError:
         pass
     return pids
+
 
 known_safe_programs = {
     "/usr/bin/systemd", "/usr/bin/dbus-daemon", "/usr/bin/NetworkManager",
@@ -1903,6 +1892,43 @@ def bpf_monitor_with_something(bpf):
     else:
         return False
 
+def is_kernel_thread(pid: int) -> bool:
+    """
+    Returns True if the process is very likely a kernel worker thread. just to improve perf
+    """
+    score = 0
+    threshold = 2
+
+    try:
+        proc = psutil.Process(pid)
+        name = proc.name()
+
+        if name.startswith('[') and name.endswith(']'):
+            score += 2
+
+        try:
+            if not proc.exe():
+                score += 1
+        except (psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+
+        try:
+            if not proc.cmdline():
+                score += 1
+        except (psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+
+        try:
+            if proc.ppid() == 2:
+                score += 1
+        except (psutil.Error, OSError):
+            pass
+
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+
+    return score >= threshold
+
 def scan_process(is_log=False, target_pid=None, scan_all=False):
     """
     The main workflow for scanning system processes (--scan option) for suspicious input device access, keylogger behavior. We have two options one for specific PID and for all the processes.
@@ -1944,20 +1970,21 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
     log(f"Starting '/dev/input/' monitoring using BPF for {bpf.timeout} seconds", True)
     captcha_result = bpf_monitor_with_something(bpf)
 
+    bpf_pid = ""
     if not captcha_result:
-        bpf.start()
+        bpf_pid = bpf.start()
         time.sleep(bpf.timeout)
 
     if is_log:
         print()
         log("BPF monitoring stopped.", True)
-    
+
     if not is_log:
         print()
     log(f"Starting memory monitoring using BPF for {mem_timeout} seconds", True)
     run_fileless_execution_loader(mem_timeout)
     log(f"Memory Monitoring stopped", is_log)
-    
+
     mem_fd_pids = read_memfd_events()
 
     sockets, _ = ipc.detect_suspicious_ipc_channels()
@@ -2130,10 +2157,6 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
             for index, proc in enumerate(psutil.process_iter(['pid', 'cmdline', 'exe', 'cwd'])):
                 pid = proc.info['pid']
 
-                sys.stdout.write(f"\033[1G")
-                sys.stdout.write(f"\033[1G{datetime.now().strftime('[%H:%M:%S]')} Scanning PID - {pid:<6} ({index}) {next(spinner)}")
-                sys.stdout.flush()
-
                 try:
                     cwd = proc.cwd()
                     cmdline = proc.cmdline()
@@ -2141,7 +2164,17 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                     name = proc.name()
                     parent_map[proc.pid] = proc.ppid()
                     path = get_path(cwd, cmdline, exe)
-                    
+
+                    if path:
+                        if skip_current_pid(path, pid) or pid == bpf_pid:
+                            continue
+
+                    if is_kernel_thread(pid):
+                        continue
+
+                    sys.stdout.write(f"\033[1G")
+                    sys.stdout.write(f"\033[1G{datetime.now().strftime('[%H:%M:%S]')} Scanning PID - {pid:<6} ({index}) {next(spinner)}")
+                    sys.stdout.flush()
 
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     if is_log:
@@ -2215,6 +2248,8 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                     TOTAL_PIDS.add(target_pid)
                     reasons_by_pid[target_pid].add("Is running from memory")
 
+            print()
+            print(f"\033[1G{datetime.now().strftime('[%H:%M:%S]')} Starting In-Depth Checks for Suspicious Processes.. This Might take some time")
             for pid in suspicious_candidates:
                 try:
                     proc = psutil.Process(pid)
@@ -2388,23 +2423,63 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
     normal_suspects = []
     sus_scores = {}
     child_group = defaultdict(list)
+    sus_libs = load_sus_libraries()
 
     for pid in suspicious_pids:
         path = fullpaths.get(pid)
+        # found_any = False
         if path:
             if path.endswith(".py"):
-                    mc = ModuleChecker(pid, load_sus_libraries())
-                    rt, py_spy_logs = mc.get_modules_using_py_spy()
-                    if rt:
-                        for f in py_spy_logs:
-                            reasons_by_pid[pid].add(f"has suspicious modules: {f}")
-                            high_sus_string_pids.append(pid)
-                            log(f"Found Suspicious libraries using py-spy: {f}", is_log_enabled)
-                    else:
-                        normal_suspects.append(pid)
+                mc = ModuleChecker(pid, load_sus_libraries())
+                rt, py_spy_logs = mc.get_modules_using_py_spy()
+                if rt:
+                    for f in py_spy_logs:
+                        reasons_by_pid[pid].add(f"has suspicious modules: {f}")
+                        high_sus_string_pids.append(pid)
+                        log(f"Found Suspicious libraries using py-spy: {f}", is_log_enabled)
+                else:
+                    normal_suspects.append(pid)
+                
+                #TODO: Fix this below:
 
+                # mem_maps_found = mc.get_libs_using_mem_maps()
+                # if mem_maps_found:
+                #     found_any = True
+                #     for f in mem_maps_found:
+                #         reasons_by_pid[pid].add(f"has suspicious libraries (maps): {f}")
+                #         high_sus_string_pids.append(pid)
+                #         log(f"Found Suspicious libraries using maps: {f}", is_log_enabled)
+                #
+                #
+                # lsof_found = mc.get_modules_using_lsof()
+                # if lsof_found:
+                #     found_any = True
+                #     for f in lsof_found:
+                #         reasons_by_pid[pid].add(f"has suspicious libraries (lsof): {f}")
+                #         high_sus_string_pids.append(pid)
+                #         log(f"Found Suspicious libraries using lsof: {f}", is_log_enabled)
+                #
+                # pmap_found = mc.get_modules_using_pmap()
+                # if pmap_found:
+                #     found_any = True
+                #     for f in pmap_found:
+                #         reasons_by_pid[pid].add(f"has suspicious libraries (pmap): {f}")
+                #         high_sus_string_pids.append(pid)
+                #         log(f"Found Suspicious libraries using pmap: {f}", is_log_enabled)
+                #
+                # if not found_any:
+                #     h_output = has_suspicious_modules(path, sus_libs)
+                #     if h_output:
+                #         for module_name, sus_score in h_output.items():
+                #             sus_scores[pid] = sus_score
+                #             if sus_score and module_name and sus_score >= 4:
+                #                 high_sus_string_pids.append(pid)
+                #                 reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
+                #                 log(f"Found Suspicious libraries: {module_name}", is_log_enabled)
+                #     else:
+                #         normal_suspects.append(pid)
             else:
-                h_output = has_suspicious_modules(path, load_sus_libraries())
+                h_output = has_suspicious_modules(path, sus_libs)
                 if h_output:
                     for module_name, sus_score in h_output.items():
                         sus_scores[pid] = sus_score
@@ -2549,7 +2624,7 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
             print()
             print(f"\n[Note] Some processes with input access are trusted and skipped:")
             for pid, path in false_positives:
-                print(f" →> PID: {pid:<6} Path: {path}")
+                print(f" -> PID: {pid:<6} Path: {path}")
             print("  (Trusted by package manager, flagged as potential false positives)")
 
 
@@ -2611,7 +2686,7 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
                 print()
                 print("\n[Note] Some processes with input access are trusted and skipped:")
                 for pid, path in new_false_positives:
-                    print(f"  →> PID: {pid:<6} Path: {path}")
+                    print(f"  -> PID: {pid:<6} Path: {path}")
                 print("  (Trusted by package manager, flagged as potential false positives)")
                 last_reported |= new_false_positives
 
@@ -2843,110 +2918,6 @@ def change_and_join(reasons):
     if isinstance(reasons, (list, tuple)):
         return " ".join(map(str, reasons))
     return str(reasons)
-
-# def phase_two_analysis(pid, path, reasons, parent_map, input_access_pids, is_log_enabled=False):
-#
-#     """
-#     Does analysis for a process identified as suspicious
-#
-#     Flow:
-#       - Initializes all analyzers: BPF monitoring, X11 analyzer, binary/file/persistence/network/IPCs.
-#       - Gathers additional context or data for the target PID, like suspected reasons, X11 activity, hidraw access, and
-#         all processes with input device access.
-#       - For each suspicious candidate:
-#           * Verifies input device access (via BPF and input_access_pids).
-#           * Checks for direct hidraw and X11 device access, then flagging them accordingly.
-#           * Runs file authenticity checks against detected suspicious processes.
-#           * Tracks paths as trusted or not, gets evidence across analyzers.
-#       - Calls check_and_report that does more checks and print if found any KeyLoggers*.
-#     """
-#
-#     bpf = BPFMONITOR(bpf_file, 5)
-#     x = X11Analyzer()
-#     ba = BinaryAnalyzer()
-#     fm = FileMonitor()
-#     pc = PersistenceChecker()
-#     ipc = IPCScanner()
-#     nm = NetworkMonitor()
-#     sockets = ipc.detect_suspicious_ipc_channels()
-#
-#     fullpaths = {}
-#     parent_map = {}
-#     reasons_by_pid = defaultdict(set)
-#     suspicious_candidates = set()
-#     trusted_paths = set()
-#     unrecognized_paths = set()
-#     suspicious_pids = set()
-#     print()
-#     log(f"Detected {len(sockets)} suspicious IPC socket(s).", is_log_enabled)
-#
-#
-#     confidence, access_rate = x.check_x11_connection(pid)
-#     if confidence >= 3 and access_rate > 0:
-#         suspicious_candidates.add(pid)
-#         TOTAL_PIDS.add(pid)
-#         reasons_by_pid[pid].add("Has input access through X11")
-#         log(f"PID {pid}: X11 access activity detected", is_log_enabled)
-#
-#     is_using_hidraw, hidraw_name = check_hidraw_connections(pid)
-#
-#     if is_using_hidraw:
-#         suspicious_candidates.add(pid)
-#         TOTAL_PIDS.add(pid)
-#         reasons_by_pid[pid].add("Has direct hidraw access")
-#         log(f"PID - {pid} -> has direct access to {hidraw_name}", is_log_enabled)
-#
-#     for pid, input_device_path in input_access_pids.items():
-#         suspicious_candidates.add(pid)
-#         if is_log_enabled:
-#             reasons_by_pid[pid].add(f"Has Access to {input_device_path}")
-#         else:
-#             reasons_by_pid[pid].add("Has Direct Input Access")
-#
-#     output = bpf.check_pid(pid)
-#     if output:
-#         reasons_by_pid[pid].add("Input Access verified using - BPF")
-#         log(f"Input Devices access detected using BPF for PID {pid}", is_log_enabled)
-#
-#     for pid in suspicious_candidates:
-#         try:
-#             proc = psutil.Process(pid)
-#             path = get_path(proc.cwd(), proc.cmdline(), proc.exe())
-#             if path:
-#                 fullpaths[pid] = path
-#                 if sockets:
-#                     for file in sockets:
-#                         #TODO: will think whether to add the trust list for monitoring.. or too much noise??
-#                         result, reason_list, _ = ba.check_file_authenticity(file, path, pid)
-#                         if not result:
-#                             trusted_paths.add(path)
-#                         else:
-#                             unrecognized_paths.add(path)
-#                             suspicious_pids.add(pid)
-#                             for reason in reason_list:
-#                                 reasons_by_pid[pid].add(reason)
-#         except (psutil.NoSuchProcess, psutil.AccessDenied):
-#             log(f"Skipping PID {pid} (process unavailable)", is_log_enabled)
-#             continue
-#
-#     for r in reasons:
-#         if any(candidate in r for candidate in suspicious_candidates):
-#             reasons_by_pid[pid].add(change_and_join(r))
-#
-#         check_and_report(
-#         fullpaths,
-#         trusted_paths,
-#         unrecognized_paths,
-#         suspicious_pids,
-#         reasons_by_pid,
-#         parent_map,
-#         ba,
-#         fm,
-#         pc,
-#         nm,
-#         scan=False,
-#         is_log_enabled=is_log_enabled,
-#     )
 
 def prompt_user_trust_a_process():
     """
