@@ -721,25 +721,46 @@ class ModuleChecker:
     def __init__(self, pid, libs):
         self.pid = pid
         self.libs = libs
+    
+    def run_all(self):
+        output = set()
+        try:
+            rt, logs = self.get_modules_using_py_spy()
+            if rt and logs:
+                output.update(logs)
+
+            mmaps = self.get_libs_using_mem_maps()
+            if mmaps:
+                output.update(mmaps)
+
+            lsof = self.get_modules_using_lsof()
+            if lsof:
+                output.update(lsof)
+
+            pmap = self.get_modules_using_pmap()
+            if pmap:
+                output.update(pmap)
+
+            return output
+        except Exception:
+            return set()
+
 
     def get_modules_using_py_spy(self):
-        logs = []
-
+        found_libs = []
         try:
-            result = subprocess.run(["py-spy", "dump", "--pid", str(self.pid)],
-                                capture_output=True, text=True)
+            result = subprocess.run(
+                ["py-spy", "dump", "--pid", str(self.pid)],
+                capture_output=True, text=True
+            )
             if result.returncode == 0:
-                found = False
                 for line in result.stdout.splitlines():
                     for mod in self.libs:
-                        if mod in line:
-                            logs.append(mod)
-                            found = True
-                return found, logs
-            else:
-                return False, logs
+                        if mod in line and mod not in found_libs:
+                            found_libs.append(mod)
+            return found_libs
         except Exception:
-             return False, logs
+            return []
 
     def get_libs_using_mem_maps(self):
         found_libs = []
@@ -2423,72 +2444,30 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
     normal_suspects = []
     sus_scores = {}
     child_group = defaultdict(list)
-    sus_libs = load_sus_libraries()
 
     for pid in suspicious_pids:
         path = fullpaths.get(pid)
-        # found_any = False
         if path:
             if path.endswith(".py"):
                 mc = ModuleChecker(pid, load_sus_libraries())
-                rt, py_spy_logs = mc.get_modules_using_py_spy()
-                if rt:
-                    for f in py_spy_logs:
+                found_libs = mc.run_all()
+
+                if found_libs:
+                    for f in found_libs:
                         reasons_by_pid[pid].add(f"has suspicious modules: {f}")
                         high_sus_string_pids.append(pid)
-                        log(f"Found Suspicious libraries using py-spy: {f}", is_log_enabled)
+                        log(f"Found Suspicious libraries: {f}", is_log_enabled)
                 else:
-                    normal_suspects.append(pid)
-                
-                #TODO: Fix this below:
-
-                # mem_maps_found = mc.get_libs_using_mem_maps()
-                # if mem_maps_found:
-                #     found_any = True
-                #     for f in mem_maps_found:
-                #         reasons_by_pid[pid].add(f"has suspicious libraries (maps): {f}")
-                #         high_sus_string_pids.append(pid)
-                #         log(f"Found Suspicious libraries using maps: {f}", is_log_enabled)
-                #
-                #
-                # lsof_found = mc.get_modules_using_lsof()
-                # if lsof_found:
-                #     found_any = True
-                #     for f in lsof_found:
-                #         reasons_by_pid[pid].add(f"has suspicious libraries (lsof): {f}")
-                #         high_sus_string_pids.append(pid)
-                #         log(f"Found Suspicious libraries using lsof: {f}", is_log_enabled)
-                #
-                # pmap_found = mc.get_modules_using_pmap()
-                # if pmap_found:
-                #     found_any = True
-                #     for f in pmap_found:
-                #         reasons_by_pid[pid].add(f"has suspicious libraries (pmap): {f}")
-                #         high_sus_string_pids.append(pid)
-                #         log(f"Found Suspicious libraries using pmap: {f}", is_log_enabled)
-                #
-                # if not found_any:
-                #     h_output = has_suspicious_modules(path, sus_libs)
-                #     if h_output:
-                #         for module_name, sus_score in h_output.items():
-                #             sus_scores[pid] = sus_score
-                #             if sus_score and module_name and sus_score >= 4:
-                #                 high_sus_string_pids.append(pid)
-                #                 reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
-                #                 log(f"Found Suspicious libraries: {module_name}", is_log_enabled)
-                #     else:
-                #         normal_suspects.append(pid)
-            else:
-                h_output = has_suspicious_modules(path, sus_libs)
-                if h_output:
-                    for module_name, sus_score in h_output.items():
-                        sus_scores[pid] = sus_score
-                        if sus_score and module_name and sus_score >= 4:
-                            high_sus_string_pids.append(pid)
-                            reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
-                            log(f"Found Suspicious libraries: {module_name}", is_log_enabled)
-                else:
-                    normal_suspects.append(pid)
+                    h_output = has_suspicious_modules(path, load_sus_libraries())
+                    if h_output:
+                        for module_name, sus_score in h_output.items():
+                            sus_scores[pid] = sus_score
+                            if sus_score and module_name and sus_score >= 4:
+                                high_sus_string_pids.append(pid)
+                                reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
+                                log(f"Found Suspicious libraries (fallback): {module_name}", is_log_enabled)
+                    else:
+                        normal_suspects.append(pid)
 
     final_suspects = list(set(high_sus_string_pids + normal_suspects))
     final_suspects = [pid for pid in final_suspects if pid in fullpaths]
