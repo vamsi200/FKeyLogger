@@ -922,7 +922,6 @@ class PersistenceChecker:
         suspicious_entries = []
 
         sus_files = ["base64", "eval", "curl", "wget", ".py", "python", "node", "perl", ".sh"]
-        suspicious_paths = ["/tmp/", "/dev/shm/", ".config/", "/.hidden/", ".local/", "/var/tmp/"]
         obfuscation_patterns = [
             r'(eval|exec|base64|echo|printf)\s+[\'\"]?[A-Za-z0-9+/=]{20,}[\'\"]?',
             r'python\s+-c\s+["\']import\s+base64',
@@ -953,7 +952,6 @@ class PersistenceChecker:
                     if not re.fullmatch(r'\d+|\*|\*/\d+', token):
                         found_script_paths.append(token)
             return found_script_paths
-
 
 
         for file in cron_files:
@@ -1147,7 +1145,7 @@ class NetworkMonitor:
 
 
 bpf_file = "bpf_output.json"
-or_file = "test.json"
+or_file = "device_map.json"
 binary = "./input_monitor_bin"
 class BPFMONITOR:
     """
@@ -1200,7 +1198,7 @@ class BPFMONITOR:
                 print(f"Error stopping BPF monitor: {e}")
 
     def get_device_names_from_bpf_file(self):
-        paths = ["/dev/input", "/dev/pts", "/dev/tty"]
+        paths = ["/dev/input/", "/dev/pts/", "/dev/tty/"]
         paths.extend(glob.glob("/dev/hidraw*"))
         updated_entries = []
 
@@ -1223,6 +1221,7 @@ class BPFMONITOR:
                                     st = os.stat(full_path)
                                     if not stat.S_ISCHR(st.st_mode):
                                         continue
+                                    # have to flip here, beacuse the ebpf code and python one uses different encoding
                                     if (os.major(st.st_rdev) == minor_value and
                                         os.minor(st.st_rdev) == major_value):
                                         matched_path = full_path
@@ -1409,6 +1408,7 @@ def has_suspicious_strings(binary_path):
         r"keyboard\.h",
     ]
     word_patterns = [
+        r"pyxhook",
         r"xopendisplay",
         r"xquerykeymap",
         r"xrecordcreatecontext",
@@ -1433,7 +1433,7 @@ def has_suspicious_strings(binary_path):
             text=True,
             timeout=5
         ).lower()
-
+        
         for pattern in path_patterns:
             if re.search(pattern, output):
                 return True, pattern.encode()
@@ -1529,15 +1529,14 @@ def hash_and_save(path, pid, name, score, ist: bool):
         True  - if hash saved (or already present)
         False - on any failure
     """
+
     try:
         h = hashlib.md5()
         with open(path, 'rb') as f:
-            while True:
-                data = f.read(4096)
-                if not data:
-                    break
-                h.update(data)
+            while chunk := f.read(4096):
+                h.update(chunk)
         file_hash = h.hexdigest()
+
         entry = {
             "pid": str(pid),
             "name": name,
@@ -1548,26 +1547,31 @@ def hash_and_save(path, pid, name, score, ist: bool):
         }
 
         file_path = "process.json"
-        if os.path.exists(file_path):
-            with open(file_path, "r") as f:
-                try:
-                    data = json.loads(f.read())
-                except json.JSONDecodeError:
-                    data = []
-        else:
-            data = []
+
+        if not os.path.exists(file_path):
+            with open(file_path, "w") as f:
+                json.dump([], f)
+
+        with open(file_path, "r") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                data = []
 
         if any(e.get("md5 hash") == file_hash for e in data):
             return True
 
         data.append(entry)
+
         with open(file_path, "w") as f:
             json.dump(data, f, indent=4)
+
         return True
 
     except Exception as e:
         print(f"[!] Failed to hash and save: {e}")
         return False
+
 
 def check_impersonating_process(pid):
     """
@@ -2228,6 +2232,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
 
                 if bpf.check_pid(pid):
                     reasons_by_pid[pid].add("Accessing Input Devices confirmed using - BPF")
+                    TOTAL_PIDS.add(pid)
                     bpf_check_pid.append(pid)
                 if is_using_hidraw:
                     suspicious_candidates.add(pid)
@@ -2293,7 +2298,7 @@ def scan_process(is_log=False, target_pid=None, scan_all=False):
                                     if not result:
                                         trusted_paths.add(path)
                                         hash_flag = hash_flag_map.get(pid, False)
-                                        if pid not in input_access_pids or pid in TOTAL_PIDS:
+                                        if pid not in TOTAL_PIDS:
                                             continue
                                         if not hash_and_save(path, pid, name, 0, hash_flag):
                                             print(f"[!] Failed to update {path}")
@@ -2444,30 +2449,37 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
     normal_suspects = []
     sus_scores = {}
     child_group = defaultdict(list)
-
+    
     for pid in suspicious_pids:
-        path = fullpaths.get(pid)
-        if path:
-            if path.endswith(".py"):
-                mc = ModuleChecker(pid, load_sus_libraries())
-                found_libs = mc.run_all()
+        normal_suspects.append(pid)
 
-                if found_libs:
-                    for f in found_libs:
-                        reasons_by_pid[pid].add(f"has suspicious modules: {f}")
+        path = fullpaths.get(pid)
+        if not path:
+            continue
+
+        found_libs = set()
+
+        if path.endswith(".py"):
+            mc = ModuleChecker(pid, load_sus_libraries())
+            found_libs = mc.run_all()
+
+        if not found_libs:
+            h_output = has_suspicious_modules(path, load_sus_libraries())
+            if h_output:
+                for module_name, sus_score in h_output.items():
+                    sus_scores[pid] = sus_score
+                    if sus_score and module_name and sus_score >= 4:
                         high_sus_string_pids.append(pid)
-                        log(f"Found Suspicious libraries: {f}", is_log_enabled)
-                else:
-                    h_output = has_suspicious_modules(path, load_sus_libraries())
-                    if h_output:
-                        for module_name, sus_score in h_output.items():
-                            sus_scores[pid] = sus_score
-                            if sus_score and module_name and sus_score >= 4:
-                                high_sus_string_pids.append(pid)
-                                reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
-                                log(f"Found Suspicious libraries (fallback): {module_name}", is_log_enabled)
-                    else:
-                        normal_suspects.append(pid)
+                        reasons_by_pid[pid].add(f"has suspicious modules: {module_name}")
+                        log(f"Found Suspicious libraries (fallback): {module_name}", is_log_enabled)
+            else:
+                normal_suspects.append(pid)
+        else:
+            for f in found_libs:
+                reasons_by_pid[pid].add(f"has suspicious modules: {f}")
+                high_sus_string_pids.append(pid)
+                log(f"Found Suspicious libraries: {f}", is_log_enabled)
+
 
     final_suspects = list(set(high_sus_string_pids + normal_suspects))
     final_suspects = [pid for pid in final_suspects if pid in fullpaths]
@@ -2598,13 +2610,13 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
         print("\n" + "-" * 50)
         print(" No suspicious keylogger activity found. ".center(50))
         print("-" * 50)
-        
-        if false_positives:
-            print()
-            print(f"\n[Note] Some processes with input access are trusted and skipped:")
-            for pid, path in false_positives:
-                print(f" -> PID: {pid:<6} Path: {path}")
-            print("  (Trusted by package manager, flagged as potential false positives)")
+
+    if false_positives and scan:
+        print()
+        print(f"\n[Note] Some processes with input access are trusted and skipped:")
+        for pid, path in false_positives:
+            print(f" -> PID: {pid:<6} Path: {path}")
+        print("  (Trusted by package manager, flagged as potential false positives)")
 
 
     if is_log_enabled and trusted_reason_list:
@@ -2655,7 +2667,6 @@ def check_and_report(fullpaths, trusted_paths, unrecognized_paths, suspicious_pi
 
             print(f" (Investigate or kill with:  kill {pid})\n")
             print()
-    
 
     elif not scan and not s_pid and not printed_pids:
         if false_positives:
@@ -2824,6 +2835,7 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
             output = bpf.check_pid(pid)
             if output:
                 reasons_by_pid[pid].add("Input Access verified using - BPF")
+                TOTAL_PIDS.add(pid)
                 if is_log_enabled:
                     print()
                     log(f"Input Devices access detected using BPF for PID {pid}", True)
@@ -2833,6 +2845,7 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
 
         for pid, input_device_path in input_access_pids.items():
             suspicious_candidates.add(pid)
+            TOTAL_PIDS.add(pid)
             if is_log_enabled:
                 reasons_by_pid[pid].add(f"Has Access to {input_device_path}")
             else:
@@ -2861,7 +2874,7 @@ def monitor_process(interval=5, is_log_enabled=False, scan_all=False):
                                 if not result:
                                     trusted_paths.add(path)
                                     hash_flag = hash_flag_map.get(pid, False)
-                                    if pid not in input_access_pids or pid in TOTAL_PIDS:
+                                    if pid not in TOTAL_PIDS:
                                         continue
                                     if not hash_and_save(path, pid, name, 0, hash_flag):
                                         print(f"[!] Failed to update {path}")
@@ -3475,16 +3488,13 @@ if __name__ == "__main__":
     k = BPFMONITOR(bpf_file)
 
     banner = r"""
-    ▄████████    ▄█   ▄█▄    ▄████████ ▄██   ▄    ▄█        ▄██████▄     ▄██████▄     ▄██████▄     ▄████████    ▄████████
-    ███    ███   ███ ▄███▀   ███    ███ ███   ██▄ ███       ███    ███   ███    ███   ███    ███   ███    ███   ███    ███
-    ███    █▀    ███▐██▀     ███    █▀  ███▄▄▄███ ███       ███    ███   ███    █▀    ███    █▀    ███    █▀    ███    ███
-    ▄███▄▄▄      ▄█████▀     ▄███▄▄▄     ▀▀▀▀▀▀███ ███       ███    ███  ▄███         ▄███         ▄███▄▄▄      ▄███▄▄▄▄██▀
-    ▀▀███▀▀▀     ▀▀█████▄    ▀▀███▀▀▀     ▄██   ███ ███       ███    ███ ▀▀███ ████▄  ▀▀███ ████▄  ▀▀███▀▀▀     ▀▀███▀▀▀▀▀
-    ███          ███▐██▄     ███    █▄  ███   ███ ███       ███    ███   ███    ███   ███    ███   ███    █▄  ▀███████████
-    ███          ███ ▀███▄   ███    ███ ███   ███ ███▌    ▄ ███    ███   ███    ███   ███    ███   ███    ███   ███    ███
-    ███          ███   ▀█▀   ██████████  ▀█████▀  █████▄▄██  ▀██████▀    ████████▀    ████████▀    ██████████   ███    ███
-                ▀                                ▀                                                             ███    ███
-    """
+    ________ __ ________  ____    ____  ______________________
+   / ____/ //_// ____/\ \/ / /   / __ \/ ____/ ____/ ____/ __ \
+  / /_  / ,<  / __/    \  / /   / / / / / __/ / __/ __/ / /_/ /
+ / __/ / /| |/ /___    / / /___/ /_/ / /_/ / /_/ / /___/ _, _/
+/_/   /_/ |_/_____/   /_/_____/\____/\____/\____/_____/_/ |_|
+            """
+
     print("\033[1;31m" + banner + "\033[0m")
 
     if args.scan:
@@ -3514,4 +3524,4 @@ if __name__ == "__main__":
             print("\n[*] Scan interrupted by user. Exiting...")
             k.stop()
     else:
-        intial_system_checks(args.log)
+        intial_system_checks()

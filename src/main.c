@@ -21,7 +21,8 @@ static void handle_event(void *ctx, int cpu, void *data, unsigned int data_sz) {
   if (!fptr)
     return;
 
-  fprintf(fptr, "{\"pid\": %u, \"major\": %u, \"minor\": %u, \"type\": %s}\n",
+  fprintf(fptr,
+          "{\"pid\": %u, \"major\": %u, \"minor\": %u, \"type\": \"%s\"}\n",
           ev->pid, ev->major, ev->minor, ev->type);
 }
 
