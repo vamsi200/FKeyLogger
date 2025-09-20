@@ -20,30 +20,28 @@
 - is_suspicious_input_device - done
 - check_obfuscated_or_packed_binaries - done
 - check_python_imports - removed
-- run_fileless_execution_loader 
-- read_memfd_events
-- check_device_type
-- get_device_names_from_bpf_file
-- check_impersonating_process
-- check_hidraw_connections
-- Class ParentProcessValidator
+- run_fileless_execution_loade - done 
+- read_memfd_events - sort of done
+- check_device_type - done
+- get_device_names_from_bpf_file - done
+- check_impersonating_process - done
+- check_hidraw_connections - done
+- Class ParentProcessValidator 
 - Class ModuleChecker - added, but not everything
 - kill_process
-- Need to add the part of creating process.json file for scan_process() function.
-- Fix the parent process thing.. - working as expected, may have to refine it??
+- A blog post, maybe, on why a method is used and giving rationale as to why we are doing certain things to find keyloggers. - done
 - Add instruction in readme to download libbpf - Done 
 - update the setup script -> add the fe_loader binary - Done
+- Update the MakeFile with the new name - Done
+- modify the template_gen script - Done
 
 Next:
-- Update the MakeFile with the new name
-- modify the template_gen script
 - > so I did some testing on other systems, there are multiple false positives(as expected), so need to improve the whitelisting process and others to reduce these false positives
 
+- Fix the parent process thing.. - working as expected, may have to refine it??
+- Need to add the part of creating process.json file for scan_process() function. - done ig 
 - Improve Performance
 - Improve the default option
-- Add log option to reasons for more verbose reasoning
-- Add log, explaining why a process is trusted
-- A blog post, maybe, on why a method is used and giving rationale as to why we are doing certain things to find keyloggers.
 - Will have to revisit the initial stages of creating process.json file and why a process is being trusted.
 - Have to cover all the edge cases like errors and others
 - **Harden the entire script, so that one can not bypass the heuristics**
