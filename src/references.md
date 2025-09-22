@@ -1,6 +1,4 @@
-Will Update all the links in future:
-
-- https://psutil.readthedocs.io/en/latest/
+- https://nakryiko.com/
 - https://elixir.bootlin.com/linux/v6.14.7/source/fs/
 - https://github.com/libbpf/libbpf-bootstrap
 - https://github.com/kartikmehta8/pyKeylogger
