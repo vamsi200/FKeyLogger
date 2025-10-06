@@ -2,8 +2,7 @@
 
 **FKeyLogger** is a security tool for detecting keyloggers on Linux systems.
 
->## STILL IN DEVELOPMENT
->
+A small blog about it - [link](https://vamsi200.github.io/posts/explaining_fkeylogger_the_rationale_behind_linux_keylogger_detection/)
 
 ## **Core Detection**
 
