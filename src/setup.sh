@@ -54,6 +54,10 @@ tar -xzf "$TAR_FILE" -C "$BPFTOOL_EXTRACT_DIR" >/dev/null || {
   echo "Extraction failed"
   exit 1
 }
+
+echo "[+] Creating bin directory for bpftool"
+mkdir "$REPO_DIR/src/bin/"
+
 mv "$BPFTOOL_EXTRACT_DIR/bpftool" "$REPO_DIR/src/bin/bpftool"
 chmod +x "$REPO_DIR/src/bin/bpftool"
 rm -rf "$TAR_FILE" "$SHA_FILE" "$BPFTOOL_EXTRACT_DIR"
