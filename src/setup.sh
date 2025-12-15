@@ -33,7 +33,7 @@ BASE_URL="https://github.com/libbpf/bpftool/releases/download/${BPFTOOL_VERSION}
 TAR_URL="${BASE_URL}/${TAR_FILE}"
 SHA_URL="${BASE_URL}/${SHA_FILE}"
 
-mkdir -p "$BPFTOOL_EXTRACT_DIR"
+mkdir "$BPFTOOL_EXTRACT_DIR"
 
 echo "[+] Downloading bpftool archive"
 curl -sSL "$TAR_URL" -o "$TAR_FILE" || {
