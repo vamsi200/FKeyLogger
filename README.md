@@ -89,14 +89,15 @@ Before running the setup script, please ensure the following dependencies are in
 - **Make + GCC**
 - **Python 3 + venv**
 - **libbpf**
+- **python virtual env**
 
 #### Arch Linux
 ```bash
-sudo pacman -Sy base-devel clang llvm libbpf
+sudo pacman -Sy base-devel clang llvm libbpf python-virtualenv
 ```
 #### Debian/Ubuntu
 ```bash
-sudo apt install build-essential clang llvm libbpf-dev linux-headers-$(uname -r)
+sudo apt install build-essential clang llvm libbpf-dev  python3-venv linux-headers-$(uname -r)
 ```
 
 > **Note:**  
