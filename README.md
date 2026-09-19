@@ -62,6 +62,9 @@ A small blog about it - [link](https://vamsi200.github.io/posts/explaining_fkeyl
 | **File activity monitoring** | Watches file descriptors for writes, creates, and modifies using inotify, reporting rapid file activity tied to a process - this, of course, will be a heuristic, as to say, when a process has input access and is also writing rapidly, it increases the suspicion. |
 | **Binary package verification** | Checks if a binary is recognized by the system’s package manager (`apt`, `dnf`, `yum`, `pacman`, `zypper`, `apk`). A positive match significantly increases the trust of that process. |
 
+## Using The Tool
+![svg](src/fkeylogger.svg)
+
 ## Usage
 
 ```bash
@@ -79,6 +82,7 @@ options:
   --log                Enable verbose logging
   --all                By default, trusted processes (based on heuristics or user input) are skipped. Use this flag to disable that behavior and scan all processes, including the trusted ones.
 ```
+
 ## Setup
 
 ### Prerequisites
